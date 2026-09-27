@@ -1,0 +1,10 @@
+[workspace]
+members = ["swag-corelib", "swag-cli"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+authors = ["Giuseppe Della Vedova"]
+repository = "https://github.com/gi-dellav/swag"

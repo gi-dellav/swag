@@ -1,0 +1,20 @@
+[package]
+name = "swag-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Easy-to-use CLI for swag (static webapp generator)"
+
+[[bin]]
+name = "swag"
+path = "src/main.rs"
+
+[dependencies]
+swag-corelib = { path = "../swag-corelib" }
+clap = { version = "4", features = ["derive", "env"] }
+serde_json = "1"
+
+[dev-dependencies]
+serde_json = "1"
