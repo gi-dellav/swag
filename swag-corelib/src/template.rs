@@ -6,10 +6,12 @@
 use std::fmt;
 use std::str::FromStr;
 
+use serde::{Deserialize, Serialize};
+
 use crate::error::{Error, Result};
 
 /// A scaffoldable project template.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Template {
     /// Static PWA: Svelte 5 + Vite + TailwindCSS 4, GitHub Pages deploy.
     SvelteClean,
@@ -89,7 +91,7 @@ impl Template {
             })
     }
 
-    fn short_alias(self) -> &'static str {
+    pub(crate) fn short_alias(self) -> &'static str {
         match self {
             Template::SvelteClean => "clean",
             Template::SvelteTauri => "tauri",

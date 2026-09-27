@@ -6,8 +6,9 @@
 
 use std::process::Command;
 
-fn swag(args: &[&str]) -> (String, String, i32) {
+fn swag_with_home(home: &std::path::Path, args: &[&str]) -> (String, String, i32) {
     let output = Command::new(env!("CARGO_BIN_EXE_swag"))
+        .env("SWAG_HOME", home)
         .args(args)
         .output()
         .expect("could not spawn swag binary");
@@ -16,6 +17,20 @@ fn swag(args: &[&str]) -> (String, String, i32) {
         String::from_utf8_lossy(&output.stderr).into_owned(),
         output.status.code().unwrap_or(-1),
     )
+}
+
+fn swag(args: &[&str]) -> (String, String, i32) {
+    // Isolate registries: the dev machine's ~/.swag must never leak into tests.
+    let home = std::env::temp_dir().join(format!(
+        "swag-cli-test-home-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    let res = swag_with_home(&home, args);
+    let _ = std::fs::remove_dir_all(&home);
+    res
 }
 
 #[test]

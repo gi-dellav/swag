@@ -19,9 +19,51 @@ Templates are fetched with `git clone --depth 1` from
 check, test and preview all shell out to `bun`, mirroring the
 `svelte-clean-template` workflow (`bun install`, `bun run dev/check/test/build`).
 
-## Usage
+## `~/.swag` home
+
+`swag` keeps state in `~/.swag` (overridable with `$SWAG_HOME`; on Windows
+`%USERPROFILE%\.swag`, falling back to `%APPDATA%\swag`):
+
+```
+~/.swag/
+  projects.json    # registered projects (swag new auto-registers)
+  templates.json   # custom templates deriving from the 3 built-ins
+```
+
+Registry files are written atomically and pretty-printed JSON, so they are
+safe to inspect or edit by hand.
+
+## Projects & templates
 
 ```bash
+swag projects                 # list registered projects
+swag projects add demo --path ./demo --template clean
+swag projects show demo
+swag projects remove demo
+swag projects prune           # drop entries whose dirs are gone (--dry-run to preview)
+
+swag templates                # list built-in + custom templates
+swag templates add blog-acme --base clean --git https://github.com/acme/blog-base.git [--ref main]
+swag templates add local-iter --base tauri --path ./my-base --description "local fork"
+swag templates show blog-acme
+swag templates remove blog-acme   # built-ins cannot be removed
+
+swag cd demo                  # open a subshell in the project dir (exit to return)
+swag cd demo --print          # print the path only (for scripting)
+```
+
+A child process cannot change its parent's working directory, so `swag cd`
+spawns an interactive shell (`$SHELL`, `cmd` on Windows) with the project
+dir as CWD instead of `cd`-ing your current shell.
+
+Custom templates derive from one builtin (`--base clean|tauri|fullstack`),
+which sets the personalization rules and Rust name validation; the content
+comes from `--git <url> [--ref <branch|tag>]` (cloned fresh at scaffold
+time) or `--path <dir>` (copied at scaffold time). `swag new --template
+blog-acme …` rewrites both the custom name and the base id, then
+auto-registers the new project in `projects.json`.
+
+## Usage
 cargo run -p swag-cli -- list
 cargo run -p swag-cli -- new --template clean my-blog --owner my-handle
 cargo run -p swag-cli -- new --template tauri my-desktop-app
@@ -52,10 +94,13 @@ Cargo.toml          # workspace (swag-corelib + swag-cli)
 swag-corelib/src/
   lib.rs            # public API surface
   template.rs       # Template enum: ids, clone URLs, aliases
-  project.rs        # scaffold/list/personalize (clone + rewrite + git init + bun install)
+  project.rs        # scaffold/list/personalize (clone|copy + rewrite + git init + bun install)
+  custom_templates.rs # custom template registry + resolve (builtin wins)
+  projects.rs       # project registry (upsert/get/prune)
+  home.rs           # ~/.swag resolution ($SWAG_HOME override) + atomic JSON
   bun.rs            # Bun wrapper (version check, install/dev/build/check/test/preview)
   error.rs          # thiserror Error
-swag-cli/src/main.rs  # clap-derive CLI: new/list/install/dev/build/check/test/preview
+swag-cli/src/main.rs  # clap-derive CLI: new/list/projects/templates/cd/install/dev/build/check/test/preview
 ```
 
 ## Development

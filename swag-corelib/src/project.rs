@@ -39,6 +39,7 @@ use std::process::Command;
 use serde::Serialize;
 
 use crate::bun::Bun;
+use crate::custom_templates::{self, ResolvedTemplate, TemplateSource};
 use crate::error::{Error, Result};
 use crate::template::Template;
 
@@ -57,8 +58,8 @@ const MAX_REWRITE_BYTES: u64 = 512 * 1024;
 /// Options controlling [`scaffold`].
 #[derive(Debug, Clone)]
 pub struct ScaffoldOptions {
-    /// Which template to clone.
-    pub template: Template,
+    /// Which template to clone (builtin id/alias or custom template name).
+    pub template: String,
     /// New project name (directory + package name).
     pub name: String,
     /// Where to create the project. Defaults to `<cwd>/<name>`.
@@ -83,7 +84,7 @@ impl ScaffoldOptions {
     /// Build minimal options for `template` + `name`.
     pub fn new(template: Template, name: &str) -> Self {
         Self {
-            template,
+            template: template.id().to_string(),
             name: name.to_string(),
             destination: None,
             git_ref: None,
@@ -100,8 +101,8 @@ impl ScaffoldOptions {
 pub struct Project {
     /// Project (package / directory) name.
     pub name: String,
-    /// Template it was created from.
-    pub template: Template,
+    /// Template it was created from (builtin id or custom name).
+    pub template: String,
     /// Absolute path of the project root.
     pub path: PathBuf,
 }
@@ -141,28 +142,46 @@ impl Project {
 /// JSON-serializable template catalogue entry (for `swag list --json`).
 #[derive(Debug, Clone, Serialize)]
 pub struct TemplateInfo {
-    /// CLI-facing id, e.g. `svelte-clean-template`.
+    /// CLI-facing id, e.g. `svelte-clean-template` (or a custom name).
     pub id: String,
     /// One-line description.
     pub description: String,
-    /// HTTPS clone URL.
+    /// HTTPS clone URL, git URL or local path of the template source.
     pub clone_url: String,
     /// Whether the template ships Rust code needing `cargo`.
     pub needs_rust: bool,
+    /// Whether this is one of the three built-in templates.
+    pub builtin: bool,
+    /// For custom templates: the builtin id they derive from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
 }
 
-/// Catalogue of every built-in template.
+/// Catalogue of built-in plus user-registered templates.
 #[must_use]
 pub fn list_templates() -> Vec<TemplateInfo> {
-    Template::ALL
+    let mut out: Vec<TemplateInfo> = Template::ALL
         .iter()
         .map(|t| TemplateInfo {
             id: t.id().to_string(),
             description: t.description().to_string(),
             clone_url: t.clone_url(),
             needs_rust: t.needs_rust(),
+            builtin: true,
+            base: None,
         })
-        .collect()
+        .collect();
+    if let Ok(customs) = custom_templates::list() {
+        out.extend(customs.iter().map(|c| TemplateInfo {
+            id: c.name.clone(),
+            description: c.description.clone(),
+            clone_url: c.source.describe(),
+            needs_rust: c.base.needs_rust(),
+            builtin: false,
+            base: Some(c.base.id().to_string()),
+        }));
+    }
+    out
 }
 
 /// Clone, personalize, detach history and optionally `bun install`.
@@ -170,19 +189,24 @@ pub fn list_templates() -> Vec<TemplateInfo> {
 /// Steps:
 /// 1. validate the project name (and `--owner` when given);
 /// 2. resolve the destination (`--output` or `<cwd>/<name>`);
-/// 3. `git clone --depth 1 <template-url> <dest>`;
-/// 4. rewrite template-name occurrences → project name (and, when `--owner`
-///    differs from the template default, `gi-dellav` → owner everywhere,
-///    `gidellav` → owner with hyphens stripped in the Tauri identifier);
+/// 3. fetch the template: builtin/custom-git → `git clone --depth 1`,
+///    custom-path → recursive copy;
+/// 4. rewrite template-name occurrences → project name (custom templates also
+///    rewrite their base id; and, when `--owner` differs from the template
+///    default, `gi-dellav` → owner everywhere, `gidellav` → owner with
+///    hyphens stripped in the Tauri identifier);
 /// 5. delete the cloned `.git/` and (unless `no_git_init`) `git init`;
-/// 6. run `bun install` (unless `no_install`).
+/// 6. run `bun install` (unless `no_install`);
+/// 7. auto-register the project in `~/.swag/projects.json`.
 pub fn scaffold(options: &ScaffoldOptions) -> Result<Project> {
-    validate_project_name(options.template, &options.name)?;
+    let resolved = custom_templates::resolve_id(&options.template)?;
+    validate_project_name_resolved(&resolved, &options.name)?;
     let owner = resolve_owner(options.owner.as_deref())?;
     let dest = resolve_destination(&options.name, options.destination.as_deref())?;
     prepare_destination(&dest, options.force)?;
-    clone_template(options.template, &dest, options.git_ref.as_deref())?;
-    personalize(&dest, options.template, &options.name, owner.as_deref())?;
+    fetch_template(&resolved, &dest, options.git_ref.as_deref())?;
+    let template_ids = resolved_template_ids(&resolved);
+    personalize_ids(&dest, &template_ids, &options.name, owner.as_deref())?;
     detach_history(&dest)?;
     if !options.no_git_init {
         git_init(&dest)?;
@@ -190,13 +214,58 @@ pub fn scaffold(options: &ScaffoldOptions) -> Result<Project> {
 
     let project = Project {
         name: options.name.clone(),
-        template: options.template,
+        template: resolved.id(),
         path: dest.clone(),
     };
     if !options.no_install {
         Bun::new()?.install(&dest)?;
     }
+    // Auto-register (best effort resolved through the registry layer; a
+    // registry failure after a successful scaffold must fail loudly so the
+    // user knows the project exists but is not tracked).
+    let previous = crate::projects::upsert(&options.name, &dest, &resolved.id(), owner.as_deref())?;
+    if previous.is_some_and(|p| p.path != dest) {
+        eprintln!(
+            "swag: project '{}' re-registered (previous path replaced)",
+            options.name
+        );
+    }
     Ok(project)
+}
+
+/// Ids rewritten during personalization: the resolved id plus, for custom
+/// templates, the base builtin id (forks still contain base strings).
+fn resolved_template_ids(resolved: &ResolvedTemplate) -> Vec<String> {
+    match resolved {
+        ResolvedTemplate::Builtin(t) => vec![t.id().to_string()],
+        ResolvedTemplate::Custom(c) => {
+            let mut ids = vec![c.name.clone()];
+            let base = c.base.id().to_string();
+            if base != c.name {
+                ids.push(base);
+            }
+            ids
+        }
+    }
+}
+
+fn fetch_template(resolved: &ResolvedTemplate, dest: &Path, git_ref: Option<&str>) -> Result<()> {
+    match resolved {
+        ResolvedTemplate::Builtin(template) => {
+            clone_template_url(&template.clone_url(), template.id(), dest, git_ref)
+        }
+        ResolvedTemplate::Custom(custom) => match &custom.source {
+            TemplateSource::Git {
+                url,
+                git_ref: base_ref,
+            } => {
+                // Explicit --git-ref wins over the registered ref.
+                let effective = git_ref.or(base_ref.as_deref());
+                clone_template_url(url, &custom.name, dest, effective)
+            }
+            TemplateSource::Path { path } => copy_template_dir(path, &custom.name, dest),
+        },
+    }
 }
 
 /// Ensure `name` is usable as a directory and a `package.json` name.
@@ -206,6 +275,20 @@ pub fn scaffold(options: &ScaffoldOptions) -> Result<Project> {
 /// would leak into `src-tauri/Cargo.toml` package names, where Cargo
 /// forbids it.
 pub fn validate_project_name(template: Template, name: &str) -> Result<()> {
+    validate_project_name_needs_rust(template.needs_rust(), template.id(), name)
+}
+
+/// Same as [`validate_project_name`] but for a resolved (builtin/custom)
+/// template, so custom templates inherit their base's Rust rules.
+pub fn validate_project_name_resolved(resolved: &ResolvedTemplate, name: &str) -> Result<()> {
+    let label = match resolved {
+        ResolvedTemplate::Builtin(t) => t.id().to_string(),
+        ResolvedTemplate::Custom(c) => format!("{} (base {})", c.name, c.base.id()),
+    };
+    validate_project_name_needs_rust(resolved.needs_rust(), &label, name)
+}
+
+fn validate_project_name_needs_rust(needs_rust: bool, label: &str, name: &str) -> Result<()> {
     if name.is_empty() {
         return Err(Error::InvalidName(
             name.to_string(),
@@ -235,12 +318,11 @@ pub fn validate_project_name(template: Template, name: &str) -> Result<()> {
             "name may only contain letters, digits, '-', '_' and '.'".to_string(),
         ));
     }
-    if template.needs_rust() && name.contains('.') {
+    if needs_rust && name.contains('.') {
         return Err(Error::InvalidName(
             name.to_string(),
             format!(
-                "the {} template ships Rust code (Cargo package names forbid '.'); use '-' or '_' instead",
-                template.id()
+                "the {label} template ships Rust code (Cargo package names forbid '.'); use '-' or '_' instead",
             ),
         ));
     }
@@ -317,22 +399,82 @@ fn prepare_destination(dest: &Path, force: bool) -> Result<()> {
     Ok(())
 }
 
-fn clone_template(template: Template, dest: &Path, git_ref: Option<&str>) -> Result<()> {
+fn clone_template_url(url: &str, label: &str, dest: &Path, git_ref: Option<&str>) -> Result<()> {
     let mut cmd = Command::new("git");
     cmd.arg("clone").arg("--depth").arg("1");
     if let Some(git_ref) = git_ref {
         cmd.arg("--branch").arg(git_ref);
     }
-    cmd.arg(template.clone_url()).arg(dest);
+    cmd.arg(url).arg(dest);
     let status = cmd.status().map_err(|e| Error::FetchFailed {
-        template: template.id().to_string(),
+        template: label.to_string(),
         reason: format!("could not spawn git: {e} (is git installed?)"),
     })?;
     if !status.success() {
         return Err(Error::FetchFailed {
-            template: template.id().to_string(),
+            template: label.to_string(),
             reason: format!("`git clone` exited with {status}"),
         });
+    }
+    Ok(())
+}
+
+/// Copy a local template directory into `dest` (skips `.git` so the new
+/// project starts detached, like the clone path).
+fn copy_template_dir(src: &Path, label: &str, dest: &Path) -> Result<()> {
+    if !src.is_dir() {
+        return Err(Error::FetchFailed {
+            template: label.to_string(),
+            reason: format!("template source '{}' is not a directory", src.display()),
+        });
+    }
+    fs::create_dir_all(dest).map_err(|e| Error::Io {
+        context: format!("could not create '{}'", dest.display()),
+        source: e,
+    })?;
+    let mut stack = vec![src.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let rel = dir
+            .strip_prefix(src)
+            .map_err(|e| Error::CommandFailed(format!("could not copy template directory: {e}")))?;
+        let target_dir = dest.join(rel);
+        fs::create_dir_all(&target_dir).map_err(|e| Error::Io {
+            context: format!("could not create '{}'", target_dir.display()),
+            source: e,
+        })?;
+        let entries = fs::read_dir(&dir).map_err(|e| Error::Io {
+            context: format!("could not list '{}'", dir.display()),
+            source: e,
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|e| Error::Io {
+                context: format!("could not list '{}'", dir.display()),
+                source: e,
+            })?;
+            let path = entry.path();
+            let file_type = entry.file_type().map_err(|e| Error::Io {
+                context: format!("could not stat '{}'", path.display()),
+                source: e,
+            })?;
+            if file_type.is_symlink() {
+                continue;
+            }
+            let rel = path.strip_prefix(src).map_err(|e| {
+                Error::CommandFailed(format!("could not copy template directory: {e}"))
+            })?;
+            if rel.components().any(|c| c.as_os_str() == ".git") {
+                continue;
+            }
+            let target = dest.join(rel);
+            if file_type.is_dir() {
+                stack.push(path);
+            } else if file_type.is_file() {
+                fs::copy(&path, &target).map_err(|e| Error::Io {
+                    context: format!("could not copy '{}'", path.display()),
+                    source: e,
+                })?;
+            }
+        }
     }
     Ok(())
 }
@@ -352,8 +494,29 @@ const TEMPLATE_OWNER_COMPACT: &str = "gidellav";
 /// README links) plus anything future templates add, by walking text files.
 /// When `owner` is `Some`, `gi-dellav` → owner everywhere and
 /// `gidellav` → owner-without-hyphens (keeps the Tauri identifier legal).
+/// Rewrite every template-name occurrence under `root` (builtin path kept
+/// for tests; prefers [`personalize_ids`] for custom templates).
+#[allow(dead_code)]
 fn personalize(root: &Path, template: Template, name: &str, owner: Option<&str>) -> Result<()> {
-    let replacements = replacement_table(template, name, owner);
+    personalize_ids(root, &[template.id().to_string()], name, owner)
+}
+
+/// Rewrite every template-name occurrence under `root`.
+///
+/// `template_ids` holds every id to rewrite (custom name first, then its base
+/// builtin id). Covers the inventoried spots (`package.json` + `bun.lock`
+/// names, PWA manifest / SEO site names, `Cargo.toml` name / `default-run` /
+/// repository, `tauri.conf.json` productName / identifier, Svelte eyebrows,
+/// README links) plus anything future templates add, by walking text files.
+/// When `owner` is `Some`, `gi-dellav` → owner everywhere and
+/// `gidellav` → owner-without-hyphens (keeps the Tauri identifier legal).
+fn personalize_ids(
+    root: &Path,
+    template_ids: &[String],
+    name: &str,
+    owner: Option<&str>,
+) -> Result<()> {
+    let replacements = replacement_table_ids(template_ids, name, owner);
     let files = collect_text_files(root)?;
     for file in files {
         let bytes = fs::read(&file).map_err(|e| Error::Io {
@@ -380,15 +543,30 @@ fn personalize(root: &Path, template: Template, name: &str, owner: Option<&str>)
 /// partially match, then Title Case, then the plain id; compact owner
 /// (`gidellav`, no hyphens possible) before the plain owner so
 /// `gi-dellav` never partially rewrites it.
+#[allow(dead_code)]
 fn replacement_table(template: Template, name: &str, owner: Option<&str>) -> Vec<(String, String)> {
-    let id = template.id();
-    let snake_from = id.replace('-', "_");
-    let snake_to = name.replace('-', "_");
-    let mut table = vec![
-        (snake_from, snake_to),
-        (title_case(id), title_case(name)),
-        (id.to_string(), name.to_string()),
-    ];
+    replacement_table_ids(&[template.id().to_string()], name, owner)
+}
+
+fn replacement_table_ids(
+    template_ids: &[String],
+    name: &str,
+    owner: Option<&str>,
+) -> Vec<(String, String)> {
+    let mut table = Vec::new();
+    for id in template_ids {
+        let snake_from = id.replace('-', "_");
+        let snake_to = name.replace('-', "_");
+        for pair in [
+            (snake_from, snake_to),
+            (title_case(id), title_case(name)),
+            (id.clone(), name.to_string()),
+        ] {
+            if !table.contains(&pair) {
+                table.push(pair);
+            }
+        }
+    }
     if let Some(owner) = owner.filter(|o| *o != TEMPLATE_OWNER) {
         table.push((TEMPLATE_OWNER_COMPACT.to_string(), owner.replace('-', "")));
         table.push((TEMPLATE_OWNER.to_string(), owner.to_string()));

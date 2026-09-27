@@ -11,6 +11,35 @@ pub enum Error {
     #[error("bun not found on PATH (requires bun >= 1.1): {0}")]
     BunNotFound(String),
 
+    /// No home directory could be determined (`$SWAG_HOME` unset and no home found).
+    #[error("could not determine swag home directory: {0}")]
+    HomeNotFound(String),
+
+    /// A registry file exists but is not valid JSON / has an unexpected shape.
+    #[error("registry '{path}' is corrupt: {reason} (delete it or fix the JSON)")]
+    RegistryCorrupt {
+        /// Path of the corrupt registry file.
+        path: String,
+        /// Human-readable reason.
+        reason: String,
+    },
+
+    /// A project name is not in the registry.
+    #[error("unknown project '{0}' (see `swag projects list`)")]
+    ProjectNotFound(String),
+
+    /// A custom template name is already registered.
+    #[error("template '{0}' already exists (use --force to overwrite)")]
+    TemplateExists(String),
+
+    /// A custom template name is not usable.
+    #[error("invalid template name '{0}': {1}")]
+    InvalidTemplateName(String, String),
+
+    /// A custom template source (git URL / path) is not usable.
+    #[error("invalid template source '{0}': {1}")]
+    InvalidSource(String, String),
+
     /// A template id is unknown (not one of the three built-ins).
     #[error("unknown template '{0}' (expected one of: {1})")]
     UnknownTemplate(String, String),
