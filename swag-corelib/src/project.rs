@@ -78,6 +78,10 @@ pub struct ScaffoldOptions {
     pub no_install: bool,
     /// Skip the fresh `git init` after detaching template history.
     pub no_git_init: bool,
+    /// Scaffold into a pre-existing directory instead of creating a new one
+    /// (`swag init`): the destination must already exist, and `--force` is
+    /// not allowed to delete it first.
+    pub init: bool,
 }
 
 impl ScaffoldOptions {
@@ -92,6 +96,7 @@ impl ScaffoldOptions {
             owner: None,
             no_install: false,
             no_git_init: false,
+            init: false,
         }
     }
 }
@@ -188,7 +193,8 @@ pub fn list_templates() -> Vec<TemplateInfo> {
 ///
 /// Steps:
 /// 1. validate the project name (and `--owner` when given);
-/// 2. resolve the destination (`--output` or `<cwd>/<name>`);
+/// 2. resolve the destination (`--output`, `<cwd>/<name>`, or the
+///    pre-existing directory for `init` mode);
 /// 3. fetch the template: builtin/custom-git → `git clone --depth 1`,
 ///    custom-path → recursive copy;
 /// 4. rewrite template-name occurrences → project name (custom templates also
@@ -198,12 +204,21 @@ pub fn list_templates() -> Vec<TemplateInfo> {
 /// 5. delete the cloned `.git/` and (unless `no_git_init`) `git init`;
 /// 6. run `bun install --ignore-scripts` (unless `no_install`);
 /// 7. auto-register the project in `~/.swag/projects.json`.
+///
+/// In `init` mode (`options.init`) the destination must already exist:
+/// `swag init` scaffolds into a pre-existing directory instead of creating
+/// a new one, so `--force` empties it (keeping the directory itself)
+/// instead of deleting it first.
 pub fn scaffold(options: &ScaffoldOptions) -> Result<Project> {
     let resolved = custom_templates::resolve_id(&options.template)?;
     validate_project_name_resolved(&resolved, &options.name)?;
     let owner = resolve_owner(options.owner.as_deref())?;
-    let dest = resolve_destination(&options.name, options.destination.as_deref())?;
-    prepare_destination(&dest, options.force)?;
+    let dest = if options.init {
+        resolve_init_destination(options.destination.as_deref())?
+    } else {
+        resolve_destination(&options.name, options.destination.as_deref())?
+    };
+    prepare_destination(&dest, options.force, options.init)?;
     fetch_template(&resolved, &dest, options.git_ref.as_deref())?;
     // Capture the exact upstream revision while the clone's `.git/` still
     // exists (it is deleted just below): provenance then pins the source.
@@ -423,9 +438,32 @@ fn resolve_destination(name: &str, output: Option<&Path>) -> Result<PathBuf> {
     Ok(cwd.join(name))
 }
 
+/// Resolve the `init` destination: `--output` when given, else the current
+/// directory. Unlike [`resolve_destination`], the directory must already
+/// exist — `swag init` never creates it.
+fn resolve_init_destination(output: Option<&Path>) -> Result<PathBuf> {
+    if let Some(dir) = output {
+        if !dir.is_dir() {
+            return Err(Error::DestinationMissing(dir.display().to_string()));
+        }
+        return Ok(dir.to_path_buf());
+    }
+    std::env::current_dir().map_err(|e| Error::Io {
+        context: "could not determine current directory".to_string(),
+        source: e,
+    })
+}
+
 /// Remove the destination when `--force` is given, else refuse to overwrite.
-fn prepare_destination(dest: &Path, force: bool) -> Result<()> {
+///
+/// In `init` mode the destination must already exist: `--force` empties it
+/// (keeping the directory itself) instead of deleting and recreating it,
+/// so `swag init --force` reuses the pre-existing directory.
+fn prepare_destination(dest: &Path, force: bool, init: bool) -> Result<()> {
     if !dest.exists() {
+        if init {
+            return Err(Error::DestinationMissing(dest.display().to_string()));
+        }
         return Ok(());
     }
     let non_empty = dest
@@ -440,8 +478,49 @@ fn prepare_destination(dest: &Path, force: bool) -> Result<()> {
         return Err(Error::DestinationExists(dest.display().to_string()));
     }
     if force {
-        fs::remove_dir_all(dest).map_err(|e| Error::Io {
-            context: format!("could not remove destination '{}'", dest.display()),
+        if init {
+            if non_empty {
+                eprintln!(
+                    "swag: emptying '{}' before scaffolding (--force)",
+                    dest.display()
+                );
+            }
+            clear_contents(dest)?;
+        } else {
+            fs::remove_dir_all(dest).map_err(|e| Error::Io {
+                context: format!("could not remove destination '{}'", dest.display()),
+                source: e,
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// Remove every entry inside `dir` while keeping `dir` itself (used by
+/// `init --force`). The template fetch (`git clone` into an empty dir, or
+/// a local copy) then proceeds exactly like a fresh scaffold.
+fn clear_contents(dir: &Path) -> Result<()> {
+    let entries = fs::read_dir(dir).map_err(|e| Error::Io {
+        context: format!("could not read destination '{}'", dir.display()),
+        source: e,
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|e| Error::Io {
+            context: format!("could not read destination '{}'", dir.display()),
+            source: e,
+        })?;
+        let path = entry.path();
+        let file_type = entry.file_type().map_err(|e| Error::Io {
+            context: format!("could not stat '{}'", path.display()),
+            source: e,
+        })?;
+        let res = if file_type.is_dir() && !file_type.is_symlink() {
+            fs::remove_dir_all(&path)
+        } else {
+            fs::remove_file(&path)
+        };
+        res.map_err(|e| Error::Io {
+            context: format!("could not remove '{}'", path.display()),
             source: e,
         })?;
     }
@@ -741,8 +820,68 @@ fn git_init(dest: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_env_lock::ENV_LOCK;
     use std::fs;
 
+    /// Isolated `SWAG_HOME` for tests that scaffold (auto-registers).
+    /// Returns the previous value; callers must restore + clean up.
+    fn isolated_home(tag: &str) -> (PathBuf, Option<String>) {
+        let dir = std::env::temp_dir().join(format!(
+            "swag-scaffold-test-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        let old = std::env::var("SWAG_HOME").ok();
+        unsafe { std::env::set_var("SWAG_HOME", &dir) };
+        (dir, old)
+    }
+
+    fn restore_home(home: &Path, old: Option<String>) {
+        unsafe {
+            match old {
+                Some(v) => std::env::set_var("SWAG_HOME", v),
+                None => std::env::remove_var("SWAG_HOME"),
+            }
+        }
+        let _ = fs::remove_dir_all(home);
+    }
+
+    fn stamp(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "swag-scaffold-test-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ))
+    }
+
+    /// Minimal local template tree: personalized name + marker file.
+    fn write_template_source(dir: &Path) {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(
+            dir.join("package.json"),
+            r#"{"name": "svelte-clean-template"}"#,
+        )
+        .unwrap();
+    }
+
+    fn register_custom(name: &str, src: &Path) {
+        let tpl = crate::CustomTemplate::new(
+            name,
+            Template::SvelteClean,
+            "test",
+            crate::TemplateSource::Path {
+                path: src.to_path_buf(),
+            },
+        )
+        .unwrap();
+        crate::custom_templates::add(tpl, true).unwrap();
+    }
     #[test]
     fn validates_names() {
         assert!(validate_project_name(Template::SvelteClean, "my-app").is_ok());
@@ -877,5 +1016,171 @@ repository = "https://github.com/gi-dellav/svelte-clean-template"
         );
         fs::remove_dir_all(&root).unwrap();
         fs::remove_dir_all(&sibling).unwrap();
+    }
+
+    /// `init` scaffolds into a pre-existing empty directory.
+    #[test]
+    fn init_uses_preexisting_dir() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let (home, old) = isolated_home("init-ok");
+        let src = stamp("init-ok-src");
+        write_template_source(&src);
+        register_custom("tpl-init-ok", &src);
+
+        let dest = stamp("init-ok-dest");
+        fs::create_dir_all(&dest).unwrap();
+        let options = ScaffoldOptions {
+            template: "tpl-init-ok".to_string(),
+            name: "demo".to_string(),
+            destination: Some(dest.clone()),
+            git_ref: None,
+            force: false,
+            owner: None,
+            no_install: true,
+            no_git_init: true,
+            init: true,
+        };
+        let project = scaffold(&options).unwrap();
+        assert_eq!(project.path, dest);
+        assert!(
+            fs::read_to_string(dest.join("package.json"))
+                .unwrap()
+                .contains("demo"),
+            "personalization must rewrite the base id"
+        );
+
+        restore_home(&home, old);
+        let _ = fs::remove_dir_all(&src);
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    /// `init` refuses a destination that does not exist yet.
+    #[test]
+    fn init_refuses_missing_dir() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let (home, old) = isolated_home("init-missing");
+        let src = stamp("init-missing-src");
+        write_template_source(&src);
+        register_custom("tpl-init-missing", &src);
+
+        let dest = stamp("init-missing-dest");
+        assert!(!dest.exists());
+        let options = ScaffoldOptions {
+            template: "tpl-init-missing".to_string(),
+            name: "demo".to_string(),
+            destination: Some(dest.clone()),
+            git_ref: None,
+            force: false,
+            owner: None,
+            no_install: true,
+            no_git_init: true,
+            init: true,
+        };
+        let err = scaffold(&options).unwrap_err();
+        assert!(
+            matches!(err, Error::DestinationMissing(_)),
+            "expected DestinationMissing, got {err:?}"
+        );
+
+        restore_home(&home, old);
+        let _ = fs::remove_dir_all(&src);
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    /// A plain `new` scaffold into a missing destination keeps working.
+    #[test]
+    fn new_creates_missing_dir() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let (home, old) = isolated_home("new-creates");
+        let src = stamp("new-creates-src");
+        write_template_source(&src);
+        register_custom("tpl-new-creates", &src);
+
+        let dest = stamp("new-creates-dest");
+        assert!(!dest.exists());
+        let options = ScaffoldOptions {
+            template: "tpl-new-creates".to_string(),
+            name: "demo".to_string(),
+            destination: Some(dest.clone()),
+            git_ref: None,
+            force: false,
+            owner: None,
+            no_install: true,
+            no_git_init: true,
+            init: false,
+        };
+        scaffold(&options).unwrap();
+        assert!(dest.join("package.json").is_file());
+
+        restore_home(&home, old);
+        let _ = fs::remove_dir_all(&src);
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    /// `init --force` empties the pre-existing directory but keeps it.
+    #[test]
+    fn init_force_clears_but_keeps_dir() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let (home, old) = isolated_home("init-force");
+        let src = stamp("init-force-src");
+        write_template_source(&src);
+        register_custom("tpl-init-force", &src);
+
+        let dest = stamp("init-force-dest");
+        fs::create_dir_all(&dest).unwrap();
+        fs::write(dest.join("stale.txt"), "stale").unwrap();
+        let options = ScaffoldOptions {
+            template: "tpl-init-force".to_string(),
+            name: "demo".to_string(),
+            destination: Some(dest.clone()),
+            git_ref: None,
+            force: true,
+            owner: None,
+            no_install: true,
+            no_git_init: true,
+            init: true,
+        };
+        scaffold(&options).unwrap();
+        assert!(dest.is_dir(), "init --force must keep the directory");
+        assert!(!dest.join("stale.txt").exists(), "stale files are cleared");
+        assert!(dest.join("package.json").is_file());
+
+        restore_home(&home, old);
+        let _ = fs::remove_dir_all(&src);
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    /// `init` into a non-empty directory without `--force` is refused.
+    #[test]
+    fn init_refuses_nonempty_without_force() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let (home, old) = isolated_home("init-dirty");
+        let src = stamp("init-dirty-src");
+        write_template_source(&src);
+        register_custom("tpl-init-dirty", &src);
+
+        let dest = stamp("init-dirty-dest");
+        fs::create_dir_all(&dest).unwrap();
+        fs::write(dest.join("stale.txt"), "stale").unwrap();
+        let options = ScaffoldOptions {
+            template: "tpl-init-dirty".to_string(),
+            name: "demo".to_string(),
+            destination: Some(dest.clone()),
+            git_ref: None,
+            force: false,
+            owner: None,
+            no_install: true,
+            no_git_init: true,
+            init: true,
+        };
+        let err = scaffold(&options).unwrap_err();
+        assert!(
+            matches!(err, Error::DestinationExists(_)),
+            "expected DestinationExists, got {err:?}"
+        );
+
+        restore_home(&home, old);
+        let _ = fs::remove_dir_all(&src);
+        let _ = fs::remove_dir_all(&dest);
     }
 }

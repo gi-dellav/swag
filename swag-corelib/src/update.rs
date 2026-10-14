@@ -461,6 +461,7 @@ mod tests {
             owner: None,
             no_install: true,
             no_git_init: true,
+            init: false,
         };
         crate::project::scaffold(&options).unwrap();
 
@@ -509,6 +510,7 @@ mod tests {
             owner: None,
             no_install: true,
             no_git_init: true,
+            init: false,
         };
         crate::project::scaffold(&options).unwrap();
 
@@ -622,6 +624,7 @@ mod tests {
             owner: None,
             no_install: true,
             no_git_init: true,
+            init: false,
         };
         crate::project::scaffold(&options).unwrap();
 

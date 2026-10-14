@@ -3,9 +3,11 @@
 //! Thin clap-derive CLI over [`swag_corelib`]. All logic lives in the
 //! library; this binary only parses arguments and reports results.
 
+use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
+use dialoguer::{Input, Select};
 
 use swag_corelib::{Error, Project, ScaffoldOptions, Template, project};
 
@@ -26,13 +28,12 @@ struct Cli {
 enum Command {
     /// Scaffold a new project from a template (git clone + personalize + bun install).
     New {
-        /// Template id: svelte-clean-template (clean), svelte-tauri-template (tauri),
-        /// svelte-fullstack-template (fullstack), or a custom `swag templates add` name.
-        #[arg(short, long, default_value = "svelte-clean-template")]
-        template: String,
+        /// template id: [default: svelte-clean-template]
+        #[arg(short, long)]
+        template: Option<String>,
 
-        /// Project name (directory + package name).
-        name: String,
+        /// Project name (directory + package name); prompted when omitted.
+        name: Option<String>,
 
         /// Destination directory (defaults to <cwd>/<name>).
         #[arg(short, long)]
@@ -50,6 +51,47 @@ enum Command {
         owner: Option<String>,
 
         /// Remove the destination first if it already exists.
+        #[arg(short, long)]
+        force: bool,
+
+        /// Skip `bun install` after scaffolding.
+        #[arg(long)]
+        no_install: bool,
+
+        /// Skip the fresh `git init` after detaching template history.
+        #[arg(long)]
+        no_git_init: bool,
+    },
+
+    /// Scaffold into a pre-existing directory instead of creating a new one.
+    ///
+    /// Like `swag new`, but the destination directory must already exist and
+    /// is used in place: `--force` empties it first (the directory itself is
+    /// kept). The destination defaults to the current directory.
+    Init {
+        /// template id: [default: svelte-clean-template]
+        #[arg(short, long)]
+        template: Option<String>,
+
+        /// Project name (package name); prompted when omitted.
+        name: Option<String>,
+
+        /// Destination directory (defaults to the current directory).
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+
+        /// Clone a branch or tag instead of the default branch.
+        /// (For custom git templates: wins over the registered ref.)
+        #[arg(long)]
+        git_ref: Option<String>,
+
+        /// GitHub owner replacing `gi-dellav` in repo slugs, URLs, Pages
+        /// domains and the Tauri `com.gidellav.*` bundle identifier.
+        /// Also read from the SWAG_GITHUB_OWNER environment variable.
+        #[arg(long, env = "SWAG_GITHUB_OWNER")]
+        owner: Option<String>,
+
+        /// Empty the destination first (the directory itself is kept).
         #[arg(short, long)]
         force: bool,
 
@@ -334,29 +376,39 @@ fn run() -> Result<(), Error> {
             no_install,
             no_git_init,
         } => {
-            let options = ScaffoldOptions {
+            run_scaffold(
                 template,
                 name,
-                destination: output,
+                output,
                 git_ref,
                 owner,
                 force,
                 no_install,
                 no_git_init,
-            };
-            let project = project::scaffold(&options)?;
-            println!(
-                "created {} from {} in {}",
-                project.name,
-                project.template,
-                project.path.display()
-            );
-            println!("registered '{}' in ~/.swag/projects.json", project.name);
-            if no_install {
-                println!("skipped `bun install` — run `bun install` in the project dir");
-            } else {
-                println!("installed dependencies with `bun install`");
-            }
+                false,
+            )?;
+        }
+        Command::Init {
+            template,
+            name,
+            output,
+            git_ref,
+            owner,
+            force,
+            no_install,
+            no_git_init,
+        } => {
+            run_scaffold(
+                template,
+                name,
+                output,
+                git_ref,
+                owner,
+                force,
+                no_install,
+                no_git_init,
+                true,
+            )?;
         }
         Command::List { json } => {
             print_templates(json)?;
@@ -611,6 +663,201 @@ fn run() -> Result<(), Error> {
         }
     }
     Ok(())
+}
+
+/// Template id used when the user does not pick one.
+const DEFAULT_TEMPLATE: &str = "svelte-clean-template";
+
+/// Shared implementation of `swag new` and `swag init`.
+///
+/// `init` scaffolds into a pre-existing directory instead of creating one
+/// (see [`ScaffoldOptions::init`]). Both commands accept an optional NAME and
+/// `--template`: when either is omitted the user is asked on stdin, either
+/// with a `dialoguer` prompt (terminal) or by reading one line from stdin
+/// (piped input), so `echo demo | swag new` works.
+#[allow(clippy::too_many_arguments)]
+fn run_scaffold(
+    template: Option<String>,
+    name: Option<String>,
+    output: Option<PathBuf>,
+    git_ref: Option<String>,
+    owner: Option<String>,
+    force: bool,
+    no_install: bool,
+    no_git_init: bool,
+    init: bool,
+) -> Result<(), Error> {
+    let name = match name {
+        Some(name) => name,
+        None => {
+            let default = if init {
+                default_init_name(output.as_deref())
+            } else {
+                None
+            };
+            prompt_project_name(default)?
+        }
+    };
+    let template = match template {
+        Some(template) => resolve_template_id(&template)?,
+        None => prompt_template()?,
+    };
+    let options = ScaffoldOptions {
+        template,
+        name,
+        destination: output,
+        git_ref,
+        force,
+        owner,
+        no_install,
+        no_git_init,
+        init,
+    };
+    let project = project::scaffold(&options)?;
+    println!(
+        "{} {} from {} in {}",
+        if init { "initialized" } else { "created" },
+        project.name,
+        project.template,
+        project.path.display()
+    );
+    println!("registered '{}' in ~/.swag/projects.json", project.name);
+    if no_install {
+        println!("skipped `bun install` — run `bun install` in the project dir");
+    } else {
+        println!("installed dependencies with `bun install`");
+    }
+    Ok(())
+}
+
+/// Canonical id for a user-supplied template id or short alias; unknown ids
+/// fail with the catalogue list, exactly like the scaffolder does.
+fn resolve_template_id(id: &str) -> Result<String, Error> {
+    Ok(swag_corelib::custom_templates::resolve_id(id)?.id())
+}
+
+/// Default project name for `swag init`: the basename of the directory being
+/// initialized (`--output` when given, else the current directory).
+///
+/// Returns `None` when the directory has no usable basename (filesystem root)
+/// or when that basename is not a valid project name, so the caller asks
+/// without offering a default instead of failing later in the scaffolder.
+fn default_init_name(output: Option<&Path>) -> Option<String> {
+    let dir = match output {
+        Some(dir) => dir.to_path_buf(),
+        None => std::env::current_dir().ok()?,
+    };
+    // `--output .` and `--output ..` have no basename of their own.
+    let dir = dir.canonicalize().unwrap_or(dir);
+    let name = dir.file_name()?.to_string_lossy().into_owned();
+    project::validate_project_name(Template::SvelteClean, &name)
+        .is_ok()
+        .then_some(name)
+}
+
+/// Ask for the project name (dialoguer on a terminal, one stdin line
+/// otherwise). `default` is used for an empty answer when there is one.
+fn prompt_project_name(default: Option<String>) -> Result<String, Error> {
+    if !stdin_prompts_supported() {
+        // Piped stdin: the next line is the name, empty = default.
+        let prompt = match &default {
+            Some(default) => format!("Project name [{default}]"),
+            None => "Project name".to_string(),
+        };
+        return match read_prompt_line(&prompt)? {
+            Some(line) if !line.is_empty() => Ok(line),
+            _ => default.ok_or_else(|| {
+                Error::CommandFailed(
+                    "no project name given (pass NAME, or pipe it on stdin)".to_string(),
+                )
+            }),
+        };
+    }
+    let mut input = Input::<String>::new()
+        .with_prompt("Project name")
+        .report(false)
+        .validate_with(|name: &String| {
+            project::validate_project_name(Template::SvelteClean, name).map_err(|e| e.to_string())
+        });
+    if let Some(default) = default {
+        input = input.default(default);
+    }
+    interact_text(input)
+}
+
+/// Ask which template to use, from the `swag templates` catalogue (built-in
+/// templates first, then custom ones).
+fn prompt_template() -> Result<String, Error> {
+    let templates = project::list_templates();
+    if !stdin_prompts_supported() {
+        // Piped stdin: one template id or alias per line, empty = default.
+        let line = read_prompt_line(&format!("Template [{}]", DEFAULT_TEMPLATE))?;
+        return match line.as_deref() {
+            None | Some("") => Ok(DEFAULT_TEMPLATE.to_string()),
+            Some(id) => resolve_template_id(id),
+        };
+    }
+    let items: Vec<String> = templates.iter().map(describe_template).collect();
+    let default = templates
+        .iter()
+        .position(|t| t.id == DEFAULT_TEMPLATE)
+        .unwrap_or(0);
+    let selection = Select::new()
+        .with_prompt("Template")
+        .items(&items)
+        .default(default)
+        .interact()
+        .map_err(|e| prompt_failed("template", e))?;
+    Ok(templates[selection].id.clone())
+}
+
+/// One `Select` row: the id plus a short qualifier for custom templates.
+fn describe_template(info: &project::TemplateInfo) -> String {
+    match &info.base {
+        Some(base) => format!("{} (custom, base {base})", info.id),
+        None => info.id.clone(),
+    }
+}
+
+/// Run a dialoguer text prompt.
+fn interact_text(input: Input<'_, String>) -> Result<String, Error> {
+    input.interact_text().map_err(|e| prompt_failed("input", e))
+}
+
+/// Whether an interactive `dialoguer` prompt can run: it reads keys from
+/// stdin and renders on stderr, so both must be terminals. Anything else
+/// (pipes, `/dev/null`, CI) takes the plain-stdin fallback below.
+fn stdin_prompts_supported() -> bool {
+    std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
+}
+
+/// Non-interactive fallback: print `prompt` to stderr and read one line from
+/// stdin. Returns `None` on EOF, `Some("")` for a blank line.
+fn read_prompt_line(prompt: &str) -> Result<Option<String>, Error> {
+    eprint!("{prompt}: ");
+    let _ = std::io::stderr().flush();
+    let mut line = String::new();
+    let read = std::io::stdin()
+        .lock()
+        .read_line(&mut line)
+        .map_err(|e| Error::Io {
+            context: "could not read from stdin".to_string(),
+            source: e,
+        })?;
+    if read == 0 {
+        return Ok(None);
+    }
+    Ok(Some(line.trim().to_string()))
+}
+
+/// Map a dialoguer failure (interrupted prompt, closed terminal) to a swag
+/// error. The `NotConnected` case is already excluded by
+/// [`stdin_prompts_supported`], so this is either EOF or Ctrl-C.
+fn prompt_failed(prompt: &str, e: dialoguer::Error) -> Error {
+    Error::Io {
+        context: format!("could not read the {prompt} prompt"),
+        source: e.into(),
+    }
 }
 
 fn print_templates(json: bool) -> Result<(), Error> {

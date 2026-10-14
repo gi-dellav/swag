@@ -62,6 +62,12 @@ pub enum Error {
     #[error("destination '{0}' already exists (use --force to overwrite)")]
     DestinationExists(String),
 
+    /// The destination directory does not exist and `swag init` needs one.
+    #[error(
+        "destination '{0}' is not a pre-existing directory (swag init scaffolds into an existing directory; use `swag new` to create one)"
+    )]
+    DestinationMissing(String),
+
     /// A directory is not a swag project (missing provenance or unknown template).
     #[error("not a swag project: {0}")]
     NotAProject(String),
