@@ -108,7 +108,7 @@ pub struct Project {
 }
 
 impl Project {
-    /// `bun install` in the project root.
+    /// `bun install --ignore-scripts` in the project root.
     pub fn install(&self) -> Result<()> {
         Bun::new()?.install(&self.path)
     }
@@ -196,7 +196,7 @@ pub fn list_templates() -> Vec<TemplateInfo> {
 ///    default, `gi-dellav` → owner everywhere, `gidellav` → owner with
 ///    hyphens stripped in the Tauri identifier);
 /// 5. delete the cloned `.git/` and (unless `no_git_init`) `git init`;
-/// 6. run `bun install` (unless `no_install`);
+/// 6. run `bun install --ignore-scripts` (unless `no_install`);
 /// 7. auto-register the project in `~/.swag/projects.json`.
 pub fn scaffold(options: &ScaffoldOptions) -> Result<Project> {
     let resolved = custom_templates::resolve_id(&options.template)?;
@@ -205,8 +205,12 @@ pub fn scaffold(options: &ScaffoldOptions) -> Result<Project> {
     let dest = resolve_destination(&options.name, options.destination.as_deref())?;
     prepare_destination(&dest, options.force)?;
     fetch_template(&resolved, &dest, options.git_ref.as_deref())?;
+    // Capture the exact upstream revision while the clone's `.git/` still
+    // exists (it is deleted just below): provenance then pins the source.
+    let commit = head_commit(&dest);
     let template_ids = resolved_template_ids(&resolved);
     personalize_ids(&dest, &template_ids, &options.name, owner.as_deref())?;
+    write_provenance(&dest, &resolved, &options.name, owner.as_deref(), commit)?;
     detach_history(&dest)?;
     if !options.no_git_init {
         git_init(&dest)?;
@@ -235,7 +239,48 @@ pub fn scaffold(options: &ScaffoldOptions) -> Result<Project> {
 
 /// Ids rewritten during personalization: the resolved id plus, for custom
 /// templates, the base builtin id (forks still contain base strings).
-fn resolved_template_ids(resolved: &ResolvedTemplate) -> Vec<String> {
+/// Capture `.swag.json` provenance right after personalization so `update`
+/// and `doctor` work from the project directory alone.
+fn write_provenance(
+    dest: &Path,
+    resolved: &ResolvedTemplate,
+    name: &str,
+    owner: Option<&str>,
+    commit: Option<String>,
+) -> Result<()> {
+    let (template, base) = match resolved {
+        ResolvedTemplate::Builtin(t) => (t.id().to_string(), None),
+        ResolvedTemplate::Custom(c) => (c.name.clone(), Some(c.base.id().to_string())),
+    };
+    let mut provenance = crate::provenance::Provenance::new(
+        name,
+        &template,
+        base.as_deref(),
+        crate::template::read_template_version(dest),
+        crate::template::read_template_type(dest),
+        owner,
+    );
+    provenance.commit = commit;
+    crate::provenance::save(dest, &provenance)
+}
+
+/// Best-effort `git rev-parse HEAD` in `dir`, used to record the exact
+/// upstream revision a project was scaffolded from (templates are cloned
+/// unpinned from the default branch; the commit makes builds reproducible).
+pub(crate) fn head_commit(dir: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(dir)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let commit = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!commit.is_empty()).then_some(commit)
+}
+
+pub(crate) fn resolved_template_ids(resolved: &ResolvedTemplate) -> Vec<String> {
     match resolved {
         ResolvedTemplate::Builtin(t) => vec![t.id().to_string()],
         ResolvedTemplate::Custom(c) => {
@@ -249,7 +294,11 @@ fn resolved_template_ids(resolved: &ResolvedTemplate) -> Vec<String> {
     }
 }
 
-fn fetch_template(resolved: &ResolvedTemplate, dest: &Path, git_ref: Option<&str>) -> Result<()> {
+pub(crate) fn fetch_template(
+    resolved: &ResolvedTemplate,
+    dest: &Path,
+    git_ref: Option<&str>,
+) -> Result<()> {
     match resolved {
         ResolvedTemplate::Builtin(template) => {
             clone_template_url(&template.clone_url(), template.id(), dest, git_ref)
@@ -400,12 +449,26 @@ fn prepare_destination(dest: &Path, force: bool) -> Result<()> {
 }
 
 fn clone_template_url(url: &str, label: &str, dest: &Path, git_ref: Option<&str>) -> Result<()> {
+    // Re-validate at use time: a stored custom template may have been edited
+    // by hand since registration, and the url/ref are handed straight to
+    // `git clone` as arguments. Rejecting a leading '-' stops them being
+    // parsed as git options (argument injection).
+    custom_templates::validate_git_url(url).map_err(|e| Error::FetchFailed {
+        template: label.to_string(),
+        reason: e.to_string(),
+    })?;
+    if let Some(git_ref) = git_ref {
+        custom_templates::validate_git_ref(git_ref).map_err(|e| Error::FetchFailed {
+            template: label.to_string(),
+            reason: e.to_string(),
+        })?;
+    }
     let mut cmd = Command::new("git");
     cmd.arg("clone").arg("--depth").arg("1");
     if let Some(git_ref) = git_ref {
         cmd.arg("--branch").arg(git_ref);
     }
-    cmd.arg(url).arg(dest);
+    cmd.arg("--").arg(url).arg(dest);
     let status = cmd.status().map_err(|e| Error::FetchFailed {
         template: label.to_string(),
         reason: format!("could not spawn git: {e} (is git installed?)"),
@@ -510,7 +573,7 @@ fn personalize(root: &Path, template: Template, name: &str, owner: Option<&str>)
 /// README links) plus anything future templates add, by walking text files.
 /// When `owner` is `Some`, `gi-dellav` → owner everywhere and
 /// `gidellav` → owner-without-hyphens (keeps the Tauri identifier legal).
-fn personalize_ids(
+pub(crate) fn personalize_ids(
     root: &Path,
     template_ids: &[String],
     name: &str,

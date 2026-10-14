@@ -3,7 +3,7 @@
 //! Bun is the canonical tool for managing generated projects
 //! (mirroring `~/svelte-clean-template/README.md`):
 //! ```bash
-//! bun install
+//! bun install --ignore-scripts
 //! bun run dev       # start the dev server
 //! bun run check     # svelte-check type/diagnostics
 //! bun run test      # unit tests with bun test
@@ -84,9 +84,13 @@ impl Bun {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
 
-    /// `bun install` in `dir`.
+    /// `bun install --ignore-scripts` in `dir`.
+    ///
+    /// Lifecycle scripts are skipped so that scaffolding a template (which
+    /// may be an untrusted custom git source) never executes arbitrary
+    /// `postinstall` code from the template's `package.json`.
     pub fn install(&self, dir: &Path) -> Result<()> {
-        self.run(dir, &["install"])
+        self.run(dir, &["install", "--ignore-scripts"])
     }
 
     /// `bun run dev` in `dir` (long-running, inherits stdio).

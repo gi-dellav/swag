@@ -189,6 +189,7 @@ fn templates_add_list_show_remove() {
 #[test]
 fn templates_reject_bad_names_and_sources() {
     let home = Home::fresh("templates-bad");
+    let missing = std::env::temp_dir().join("swag-definitely-missing-xyz");
 
     let (_, err, code) = home.run(&[
         "templates",
@@ -221,7 +222,7 @@ fn templates_reject_bad_names_and_sources() {
         "--base",
         "clean",
         "--path",
-        "/tmp/opencode/swag-definitely-missing-xyz",
+        missing.to_str().expect("utf8"),
     ]);
     assert_ne!(code, 0);
     assert!(err.contains("does not exist"), "{err}");

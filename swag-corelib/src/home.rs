@@ -9,6 +9,7 @@
 //! (write `<file>.tmp` + `rename`) so a crash never leaves half-written JSON.
 
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
 
 use crate::error::{Error, Result};
@@ -76,23 +77,43 @@ pub fn ensure_home() -> Result<PathBuf> {
 
 /// Serialize `value` as pretty JSON and write it atomically to `path`.
 pub fn write_json_atomic<T: serde::Serialize>(path: &std::path::Path, value: &T) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| Error::Io {
-            context: format!("could not create '{}'", parent.display()),
-            source: e,
-        })?;
-    }
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    fs::create_dir_all(parent).map_err(|e| Error::Io {
+        context: format!("could not create '{}'", parent.display()),
+        source: e,
+    })?;
     let rendered = serde_json::to_string_pretty(value)
-        .map_err(|e| Error::CommandFailed(format!("could not render JSON: {e}")))?;
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, rendered).map_err(|e| Error::Io {
+        .map_err(|e| Error::Internal(format!("could not render JSON: {e}")))?;
+    // `<file>.tmp` beside the target (same filesystem → rename is atomic).
+    let tmp = path.with_file_name(format!(
+        "{}.tmp",
+        path.file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "swag".to_string())
+    ));
+    let mut file = fs::File::create(&tmp).map_err(|e| Error::Io {
         context: format!("could not write '{}'", tmp.display()),
         source: e,
     })?;
+    file.write_all(rendered.as_bytes()).map_err(|e| Error::Io {
+        context: format!("could not write '{}'", tmp.display()),
+        source: e,
+    })?;
+    // Flush the data before renaming, then flush the directory entry so the
+    // rename itself survives a crash (atomic vs torn writes is not enough).
+    file.sync_all().map_err(|e| Error::Io {
+        context: format!("could not flush '{}'", tmp.display()),
+        source: e,
+    })?;
+    drop(file);
     fs::rename(&tmp, path).map_err(|e| Error::Io {
         context: format!("could not write '{}'", path.display()),
         source: e,
     })?;
+    #[cfg(unix)]
+    if let Ok(dir) = fs::File::open(parent) {
+        let _ = dir.sync_all();
+    }
     Ok(())
 }
 
@@ -105,11 +126,9 @@ mod tests {
     fn swag_home_env_override_wins() {
         let _guard = ENV_LOCK.lock().unwrap();
         let old = std::env::var("SWAG_HOME").ok();
-        unsafe { std::env::set_var("SWAG_HOME", "/tmp/opencode/swag-home-test") };
-        assert_eq!(
-            swag_home().unwrap(),
-            PathBuf::from("/tmp/opencode/swag-home-test")
-        );
+        let target = std::env::temp_dir().join("swag-home-test");
+        unsafe { std::env::set_var("SWAG_HOME", &target) };
+        assert_eq!(swag_home().unwrap(), target);
         unsafe {
             match old {
                 Some(v) => std::env::set_var("SWAG_HOME", v),

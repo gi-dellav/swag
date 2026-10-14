@@ -7,6 +7,11 @@ pub enum Error {
     #[error("command failed: {0}")]
     CommandFailed(String),
 
+    /// An internal invariant failed (JSON rendering, tree walking, …):
+    /// never caused by user input, so it signals a bug rather than a fix.
+    #[error("internal error: {0}")]
+    Internal(String),
+
     /// The `bun` binary could not be found on PATH.
     #[error("bun not found on PATH (requires bun >= 1.1): {0}")]
     BunNotFound(String),
@@ -56,6 +61,14 @@ pub enum Error {
     /// The destination directory already exists and `--force` was not given.
     #[error("destination '{0}' already exists (use --force to overwrite)")]
     DestinationExists(String),
+
+    /// A directory is not a swag project (missing provenance or unknown template).
+    #[error("not a swag project: {0}")]
+    NotAProject(String),
+
+    /// The project has uncommitted changes; re-run with `--force` to overwrite.
+    #[error("project has uncommitted changes: {0}")]
+    DirtyTree(String),
 
     /// A project name is not usable as a directory / package name.
     #[error("invalid project name '{0}': {1}")]

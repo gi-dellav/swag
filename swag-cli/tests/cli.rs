@@ -73,13 +73,15 @@ fn list_alias_and_json_work() {
 
 #[test]
 fn unknown_template_errors_helpfully() {
+    let nope = std::env::temp_dir().join("swag-cli-test-nope");
+    let nope = nope.to_str().expect("utf8");
     let (_, err, code) = swag(&[
         "new",
         "--template",
         "svelte-native",
         "demo",
         "--output",
-        "/tmp/opencode/swag-cli-test-nope",
+        nope,
         "--no-install",
         "--no-git-init",
     ]);
@@ -93,12 +95,14 @@ fn invalid_name_errors_before_network() {
     // Empty / bad names must fail before any `git clone` is attempted.
     // (`--` separates the positional NAME from clap flag parsing so that
     // leading-dash names reach our own validator.)
+    let nope = std::env::temp_dir().join("swag-cli-test-nope");
+    let nope = nope.to_str().expect("utf8");
     let (_, err, code) = swag(&[
         "new",
         "--template",
         "clean",
         "--output",
-        "/tmp/opencode/swag-cli-test-nope",
+        nope,
         "--no-install",
         "--no-git-init",
         "--",
@@ -110,13 +114,15 @@ fn invalid_name_errors_before_network() {
 
 #[test]
 fn invalid_owner_errors_before_network() {
+    let nope = std::env::temp_dir().join("swag-cli-test-nope");
+    let nope = nope.to_str().expect("utf8");
     let (_, err, code) = swag(&[
         "new",
         "--template",
         "clean",
         "demo",
         "--output",
-        "/tmp/opencode/swag-cli-test-nope",
+        nope,
         "--owner",
         "not_an_owner!",
         "--no-install",

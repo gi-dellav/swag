@@ -83,9 +83,13 @@ identifier, Svelte eyebrows, README, …) to the project name — and, when
 URLs, Pages domains and the Tauri `com.gidellav.*` identifier to your handle
 (hyphens stripped there, where they are illegal). It then detaches the
 template git history (`git init` fresh, unless `--no-git-init`), and runs
-`bun install` (unless `--no-install`). Other flags: `--output <dir>`,
-`--git-ref <branch|tag>`, `--force`. `--owner` is also read from the
-`SWAG_GITHUB_OWNER` environment variable.
+`bun install --ignore-scripts` (unless `--no-install`) so that a template's
+lifecycle/`postinstall` scripts are never executed — custom templates can
+point at an untrusted git source. Before deleting the clone's `.git/`, the
+exact upstream revision (`git rev-parse HEAD`) is recorded in `.swag.json`
+provenance, pinning an otherwise unpinned `main` clone. Other flags:
+`--output <dir>`, `--git-ref <branch|tag>`, `--force`. `--owner` is also
+read from the `SWAG_GITHUB_OWNER` environment variable.
 
 ## Workspace layout
 
@@ -93,15 +97,64 @@ template git history (`git init` fresh, unless `--no-git-init`), and runs
 Cargo.toml          # workspace (swag-corelib + swag-cli)
 swag-corelib/src/
   lib.rs            # public API surface
-  template.rs       # Template enum: ids, clone URLs, aliases
+  template.rs       # Template enum + TemplateType (.template_version/.template_type)
   project.rs        # scaffold/list/personalize (clone|copy + rewrite + git init + bun install)
+  provenance.rs     # .swag.json written at scaffold time (template/base/version/type/owner)
+  update.rs         # version-aware update (fetch fresh, personalize, diff, apply)
+  doctor.rs         # read-only env/home/project health checks (+ safe --fix)
   custom_templates.rs # custom template registry + resolve (builtin wins)
   projects.rs       # project registry (upsert/get/prune)
   home.rs           # ~/.swag resolution ($SWAG_HOME override) + atomic JSON
   bun.rs            # Bun wrapper (version check, install/dev/build/check/test/preview)
   error.rs          # thiserror Error
-swag-cli/src/main.rs  # clap-derive CLI: new/list/projects/templates/cd/install/dev/build/check/test/preview
+swag-cli/src/main.rs  # clap-derive CLI: new/list/projects/templates/cd/update/doctor/install/dev/build/check/test/preview
 ```
+
+## Template versioning
+
+New templates ship two files (no agent needed, plain file reads):
+
+- `.template_version`: a single number (e.g. `21`), bumped on every template change.
+- `.template_type`: `frontend`, `backend` or `desktop`; drives name validation
+  (Cargo forbids `.` for `backend`/`desktop`) and `doctor` expectations
+  (`backend`/`desktop` want a Rust layout, `desktop` wants `src-tauri/`).
+
+Built-ins map to `clean → frontend`, `tauri → desktop`, `fullstack → backend`.
+`scaffold` copies both files into the project and records them plus the
+template id in `.swag.json` provenance, so `update`/`doctor` work from the
+project directory alone (legacy projects without `.swag.json` fall back to
+the version/type files plus a reverse registry lookup).
+
+## Updating projects (`swag update`)
+
+```bash
+swag update                   # current dir: diff against template HEAD
+swag update demo --check      # report only; exit 1 when behind
+swag update demo --dry-run    # list M/A/D files without writing
+swag update demo --json       # machine-readable report
+swag update demo --prune      # also delete files removed upstream
+swag update demo --force      # apply despite uncommitted git changes
+swag update demo --git-ref main
+```
+
+The file diff is ground truth: `--check`/`--dry-run`/apply all compare the
+project against a freshly fetched, re-personalized template. `.template_version`
+is reported for information only, so a template that changes content without
+bumping its version is still detected. Removed upstream files are reported,
+never deleted, unless `--prune`. Apply refuses on a dirty git tree unless
+`--force`, and records the fetched revision in `.swag.json`.
+
+## Health checks (`swag doctor`)
+
+```bash
+swag doctor                   # bun/git/cargo, ~/.swag, registries
+swag doctor demo              # …plus project checks (version/type/package)
+swag doctor --json
+swag doctor --fix             # only: create ~/.swag, prune stale entries
+```
+
+Exit 1 on any `FAIL` (missing `package.json`, unparsable version, unknown
+type…); warnings (no `node_modules`, legacy files, dirty tree) tolerate.
 
 ## Development
 

@@ -6,17 +6,20 @@
 
 pub mod bun;
 pub mod custom_templates;
+pub mod doctor;
 pub mod error;
 pub mod home;
 pub mod project;
 pub mod projects;
+pub mod provenance;
 pub mod template;
 #[cfg(test)]
 pub(crate) mod test_env_lock;
+pub mod update;
 
 pub use bun::Bun;
 pub use custom_templates::{CustomTemplate, ResolvedTemplate, TemplateSource};
 pub use error::{Error, Result};
 pub use project::{Project, ScaffoldOptions};
 pub use projects::ProjectEntry;
-pub use template::Template;
+pub use template::{Template, TemplateType};

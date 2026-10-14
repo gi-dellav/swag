@@ -148,8 +148,15 @@ pub fn validate_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Ensure a git URL looks plausible (HTTPS or SSH).
-fn validate_git_url(url: &str) -> Result<()> {
+/// Ensure a git URL looks plausible (HTTPS or SSH) and cannot be mistaken
+/// for an option when handed to `git clone`.
+pub(crate) fn validate_git_url(url: &str) -> Result<()> {
+    if url.starts_with('-') {
+        return Err(Error::InvalidSource(
+            url.to_string(),
+            "git URL must not start with '-'".to_string(),
+        ));
+    }
     if url.starts_with("https://") && url.len() > "https://".len() {
         return Ok(());
     }
@@ -162,10 +169,28 @@ fn validate_git_url(url: &str) -> Result<()> {
     ))
 }
 
+/// Ensure a git ref (branch / tag) cannot be mistaken for an option when
+/// passed to `git clone --branch`.
+pub(crate) fn validate_git_ref(git_ref: &str) -> Result<()> {
+    if git_ref.is_empty() || git_ref.starts_with('-') {
+        return Err(Error::InvalidSource(
+            git_ref.to_string(),
+            "git ref must not be empty or start with '-'".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Validate a source; local paths must exist and be directories.
 fn validate_source(source: &TemplateSource) -> Result<()> {
     match source {
-        TemplateSource::Git { url, .. } => validate_git_url(url),
+        TemplateSource::Git { url, git_ref } => {
+            validate_git_url(url)?;
+            if let Some(git_ref) = git_ref {
+                validate_git_ref(git_ref)?;
+            }
+            Ok(())
+        }
         TemplateSource::Path { path } => {
             if !path.exists() {
                 return Err(Error::InvalidSource(
@@ -358,7 +383,7 @@ mod tests {
             base: Template::SvelteClean,
             description: String::new(),
             source: TemplateSource::Path {
-                path: PathBuf::from("/tmp/opencode/swag-definitely-missing-xyz"),
+                path: std::env::temp_dir().join("swag-definitely-missing-xyz"),
             },
             created_at: None,
         };
