@@ -7,6 +7,7 @@ use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
+use colorized::{Color, Colors};
 use dialoguer::{Input, Select};
 
 use swag_corelib::{Error, Project, ScaffoldOptions, Template, project};
@@ -61,6 +62,10 @@ enum Command {
         /// Skip the fresh `git init` after detaching template history.
         #[arg(long)]
         no_git_init: bool,
+
+        /// Force colorized output (colors are on by default when stdout is a TTY).
+        #[arg(long)]
+        colorized: bool,
     },
 
     /// Scaffold into a pre-existing directory instead of creating a new one.
@@ -102,6 +107,10 @@ enum Command {
         /// Skip the fresh `git init` after detaching template history.
         #[arg(long)]
         no_git_init: bool,
+
+        /// Force colorized output (colors are on by default when stdout is a TTY).
+        #[arg(long)]
+        colorized: bool,
     },
 
     /// List the available templates (built-in + custom).
@@ -110,6 +119,10 @@ enum Command {
         /// Print the catalogue as JSON.
         #[arg(long)]
         json: bool,
+
+        /// Force colorized output (colors are on by default when stdout is a TTY).
+        #[arg(long)]
+        colorized: bool,
     },
 
     /// Manage registered projects in ~/.swag/projects.json.
@@ -132,6 +145,10 @@ enum Command {
         /// Print the template list as JSON (only without a subcommand).
         #[arg(long)]
         json: bool,
+
+        /// Force colorized output (colors are on by default when stdout is a TTY).
+        #[arg(long)]
+        colorized: bool,
     },
 
     /// Open a subshell in a registered project's directory.
@@ -372,6 +389,10 @@ enum TemplatesCommand {
         /// Print as JSON.
         #[arg(long)]
         json: bool,
+
+        /// Force colorized output (colors are on by default when stdout is a TTY).
+        #[arg(long)]
+        colorized: bool,
     },
     /// Register a custom template deriving from a built-in.
     Add {
@@ -437,7 +458,9 @@ fn run() -> Result<(), Error> {
             force,
             no_install,
             no_git_init,
+            colorized,
         } => {
+            print_banner(colorized);
             run_scaffold(
                 template,
                 name,
@@ -447,6 +470,7 @@ fn run() -> Result<(), Error> {
                 force,
                 no_install,
                 no_git_init,
+                colorized,
                 false,
             )?;
         }
@@ -459,7 +483,9 @@ fn run() -> Result<(), Error> {
             force,
             no_install,
             no_git_init,
+            colorized,
         } => {
+            print_banner(colorized);
             run_scaffold(
                 template,
                 name,
@@ -469,11 +495,12 @@ fn run() -> Result<(), Error> {
                 force,
                 no_install,
                 no_git_init,
+                colorized,
                 true,
             )?;
         }
-        Command::List { json } => {
-            print_templates(json)?;
+        Command::List { json, colorized } => {
+            print_templates(json, colorized)?;
         }
         Command::Projects { command, json } => match command {
             None => print_projects(json)?,
@@ -549,9 +576,16 @@ fn run() -> Result<(), Error> {
                 }
             }
         },
-        Command::Templates { command, json } => match command {
-            None => print_templates(json)?,
-            Some(TemplatesCommand::List { json: inner }) => print_templates(inner)?,
+        Command::Templates {
+            command,
+            json,
+            colorized,
+        } => match command {
+            None => print_templates(json, colorized)?,
+            Some(TemplatesCommand::List {
+                json: inner,
+                colorized,
+            }) => print_templates(inner, colorized)?,
             Some(TemplatesCommand::Add {
                 name,
                 base,
@@ -648,14 +682,17 @@ fn run() -> Result<(), Error> {
             }
         }
         Command::Install { dir } => {
+            print_banner(false);
             let bun = swag_corelib::Bun::new()?;
             bun.install(&dir)?;
             println!("`bun install` OK in {}", dir.display());
         }
         Command::Dev { dir, extra } => {
+            print_banner(false);
             project_at(&dir).dev(&extra)?;
         }
         Command::Build { dir, extra } => {
+            print_banner(false);
             project_at(&dir).build(&extra)?;
             println!("`bun run build` OK in {}", dir.display());
         }
@@ -664,10 +701,12 @@ fn run() -> Result<(), Error> {
             println!("`bun run check` OK in {}", dir.display());
         }
         Command::Test { dir, extra } => {
+            print_banner(false);
             project_at(&dir).test(&extra)?;
             println!("`bun run test` OK in {}", dir.display());
         }
         Command::Preview { dir, extra } => {
+            print_banner(false);
             project_at(&dir).preview(&extra)?;
         }
         Command::Update {
@@ -713,6 +752,7 @@ fn run() -> Result<(), Error> {
             force,
             extra,
         } => {
+            print_banner(false);
             let dir = resolve_update_target(&target)?;
             let kind = swag_corelib::vercel::detect_kind(&dir)?;
             for note in swag_corelib::vercel::preflight(&dir, &kind)? {
@@ -782,6 +822,30 @@ fn run() -> Result<(), Error> {
 /// Template id used when the user does not pick one.
 const DEFAULT_TEMPLATE: &str = "svelte-clean-template";
 
+/// Whether `stderr` is an interactive terminal: the banner goes there, so it
+/// colorizes only when stderr is a TTY (or `--colorized` forces it on; the
+/// `colorized` crate always emits ANSI codes itself).
+fn banner_colorized(force: bool) -> bool {
+    force || std::io::stderr().is_terminal()
+}
+
+/// Print `⬢ SWAG {version}` in light blue to stderr, at the start of the
+/// `new`/`init`/`dev`/`build`/`install`/`preview`/`vc`/`test` commands.
+fn print_banner(force_color: bool) {
+    let banner = format!("⬢ SWAG {}", env!("CARGO_PKG_VERSION"));
+    if banner_colorized(force_color) {
+        eprintln!("{}", banner.color(Colors::BrightBlueFg));
+    } else {
+        eprintln!("{banner}");
+    }
+}
+
+/// Whether stdout color output is wanted: `--colorized` forces it on,
+/// otherwise colors default to on when stdout is a TTY.
+fn stdout_colorized(force: bool) -> bool {
+    force || std::io::stdout().is_terminal()
+}
+
 /// Shared implementation of `swag new` and `swag init`.
 ///
 /// `init` scaffolds into a pre-existing directory instead of creating one
@@ -799,6 +863,7 @@ fn run_scaffold(
     force: bool,
     no_install: bool,
     no_git_init: bool,
+    colorized: bool,
     init: bool,
 ) -> Result<(), Error> {
     let name = match name {
@@ -828,16 +893,40 @@ fn run_scaffold(
         init,
     };
     let project = project::scaffold(&options)?;
-    println!(
-        "{} {} from {} in {}",
-        if init { "initialized" } else { "created" },
-        project.name,
-        project.template,
-        project.path.display()
-    );
-    println!("registered '{}' in ~/.swag/projects.json", project.name);
+    let colorized = stdout_colorized(colorized);
+    let verb = if init { "initialized" } else { "created" };
+    if colorized {
+        println!(
+            "{} {} {} {} {} {}",
+            verb.color(Colors::BrightGreenFg),
+            project.name.color(Colors::BrightWhiteFg),
+            "from".color(Colors::BrightBlackFg),
+            project.template.color(Colors::BrightCyanFg),
+            "in".color(Colors::BrightBlackFg),
+            project.path.display().to_string().color(Colors::BlueFg),
+        );
+        println!(
+            "{} '{}' {}",
+            "registered".color(Colors::BrightGreenFg),
+            project.name.color(Colors::BrightWhiteFg),
+            "in ~/.swag/projects.json".color(Colors::BrightBlackFg),
+        );
+    } else {
+        println!(
+            "{verb} {} from {} in {}",
+            project.name,
+            project.template,
+            project.path.display()
+        );
+        println!("registered '{}' in ~/.swag/projects.json", project.name);
+    }
     if no_install {
         println!("skipped `bun install` — run `bun install` in the project dir");
+    } else if colorized {
+        println!(
+            "{}",
+            "installed dependencies with `bun install`".color(Colors::BrightGreenFg)
+        );
     } else {
         println!("installed dependencies with `bun install`");
     }
@@ -974,12 +1063,30 @@ fn prompt_failed(prompt: &str, e: dialoguer::Error) -> Error {
     }
 }
 
-fn print_templates(json: bool) -> Result<(), Error> {
+fn print_templates(json: bool, force_color: bool) -> Result<(), Error> {
     let templates = project::list_templates();
     if json {
         let rendered = serde_json::to_string_pretty(&templates)
             .map_err(|e| Error::Internal(format!("could not render JSON: {e}")))?;
         println!("{rendered}");
+    } else if stdout_colorized(force_color) {
+        for t in templates {
+            println!("{}", t.id.color(Colors::BrightCyanFg));
+            if !t.builtin {
+                println!(
+                    "  {}",
+                    format!("(custom, base {})", t.base.as_deref().unwrap_or("?"))
+                        .color(Colors::BrightMagentaFg)
+                );
+            }
+            let description = if t.description.is_empty() {
+                "(no description)"
+            } else {
+                &t.description
+            };
+            println!("  {}", description.color(Colors::BrightWhiteFg));
+            println!("  {}", t.clone_url.color(Colors::BlueFg));
+        }
     } else {
         for t in templates {
             if t.builtin {

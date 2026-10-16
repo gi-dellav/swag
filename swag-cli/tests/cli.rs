@@ -139,3 +139,111 @@ fn help_mentions_owner_flag() {
     assert!(out.contains("--owner"), "{out}");
     assert!(out.contains("SWAG_GITHUB_OWNER"), "{out}");
 }
+
+#[test]
+fn help_mentions_colorized_flag() {
+    for args in [
+        &["new", "--help"][..],
+        &["init", "--help"][..],
+        &["templates", "--help"][..],
+        &["list", "--help"][..],
+    ] {
+        let (out, _, code) = swag(args);
+        assert_eq!(code, 0, "{args:?}: {out}");
+        assert!(out.contains("--colorized"), "{args:?}:\n{out}");
+    }
+}
+
+#[test]
+fn banner_heads_new_init_and_vc_stderr() {
+    // The `⬢ SWAG {version}` banner prints first on stderr, even when the
+    // command then fails (stderr is piped here, so it stays plain).
+    let nope = std::env::temp_dir().join("swag-cli-test-nope");
+    let nope = nope.to_str().expect("utf8");
+    let (_, err, code) = swag(&[
+        "new",
+        "--template",
+        "svelte-native",
+        "demo",
+        "--output",
+        nope,
+        "--no-install",
+        "--no-git-init",
+    ]);
+    assert_ne!(code, 0);
+    assert!(
+        err.lines().next().unwrap_or("").starts_with("⬢ SWAG "),
+        "{err}"
+    );
+
+    let missing = std::env::temp_dir().join("swag-cli-test-missing-init");
+    let (_, err, code) = swag(&[
+        "init",
+        "--template",
+        "clean",
+        "demo",
+        "--output",
+        missing.to_str().expect("utf8"),
+        "--no-install",
+        "--no-git-init",
+    ]);
+    assert_ne!(code, 0);
+    assert!(
+        err.lines().next().unwrap_or("").starts_with("⬢ SWAG "),
+        "{err}"
+    );
+
+    let (_, err, code) = swag(&["vc", "missing-xyz"]);
+    assert_ne!(code, 0);
+    assert!(
+        err.lines().next().unwrap_or("").starts_with("⬢ SWAG "),
+        "{err}"
+    );
+}
+
+#[test]
+fn colorized_flag_adds_ansi_to_banner_and_templates() {
+    // Piped output stays plain by default; `--colorized` forces ANSI codes
+    // on both the stderr banner (light blue) and the template catalogue.
+    let nope = std::env::temp_dir().join("swag-cli-test-nope");
+    let nope = nope.to_str().expect("utf8");
+    let (_, err, code) = swag(&[
+        "new",
+        "--colorized",
+        "--template",
+        "svelte-native",
+        "demo",
+        "--output",
+        nope,
+        "--no-install",
+        "--no-git-init",
+    ]);
+    assert_ne!(code, 0);
+    assert!(
+        err.lines()
+            .next()
+            .unwrap_or("")
+            .starts_with("\u{1b}[94m⬢ SWAG "),
+        "{err}"
+    );
+
+    let (out, _, code) = swag(&["templates"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(!out.contains('\u{1b}'), "piped output must stay plain");
+
+    for args in [
+        &["templates", "--colorized"][..],
+        &["list", "--colorized"][..],
+    ] {
+        let (out, _, code) = swag(args);
+        assert_eq!(code, 0, "{args:?}: {out}");
+        assert!(out.contains("\u{1b}["), "{args:?} must emit ANSI:\n{out}");
+    }
+
+    // `--json` output stays machine-readable (no banner on stdout, no color).
+    let (out, err, code) = swag(&["templates", "--json"]);
+    assert_eq!(code, 0, "{out} {err}");
+    let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+    assert!(parsed.is_array(), "{out}");
+    assert!(!out.contains('\u{1b}'), "{out}");
+}
