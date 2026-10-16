@@ -26,7 +26,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Scaffold a new project from a template (git clone + personalize + bun install).
+    /// Scaffold a new project from a template.
     New {
         /// template id: [default: svelte-clean-template]
         #[arg(short, long)]
@@ -54,7 +54,7 @@ enum Command {
         #[arg(short, long)]
         force: bool,
 
-        /// Skip `bun install` after scaffolding.
+        /// Skip installing dependencies after scaffolding.
         #[arg(long)]
         no_install: bool,
 
@@ -95,7 +95,7 @@ enum Command {
         #[arg(short, long)]
         force: bool,
 
-        /// Skip `bun install` after scaffolding.
+        /// Skip installing dependencies after scaffolding.
         #[arg(long)]
         no_install: bool,
 
@@ -148,64 +148,64 @@ enum Command {
         print: bool,
     },
 
-    /// Run `bun install` in a project directory.
+    /// Install dependencies in a project directory.
     Install {
         /// Project directory (defaults to the current directory).
         #[arg(default_value = ".")]
         dir: PathBuf,
     },
 
-    /// Run the dev server (`bun run dev`) in a project directory.
+    /// Run the dev server in a project directory.
     Dev {
         /// Project directory (defaults to the current directory).
         #[arg(default_value = ".")]
         dir: PathBuf,
 
-        /// Extra arguments forwarded after `--` to the bun script.
+        /// Extra arguments forwarded after `--` to the script.
         #[arg(last = true)]
         extra: Vec<String>,
     },
 
-    /// Production build (`bun run build`) in a project directory.
+    /// Production build in a project directory.
     Build {
         /// Project directory (defaults to the current directory).
         #[arg(default_value = ".")]
         dir: PathBuf,
 
-        /// Extra arguments forwarded after `--` to the bun script.
+        /// Extra arguments forwarded after `--` to the script.
         #[arg(last = true)]
         extra: Vec<String>,
     },
 
-    /// Type-check (`bun run check`) in a project directory.
+    /// Type-check in a project directory.
     Check {
         /// Project directory (defaults to the current directory).
         #[arg(default_value = ".")]
         dir: PathBuf,
 
-        /// Extra arguments forwarded after `--` to the bun script.
+        /// Extra arguments forwarded after `--` to the script.
         #[arg(last = true)]
         extra: Vec<String>,
     },
 
-    /// Unit tests (`bun run test`) in a project directory.
+    /// Unit tests in a project directory.
     Test {
         /// Project directory (defaults to the current directory).
         #[arg(default_value = ".")]
         dir: PathBuf,
 
-        /// Extra arguments forwarded after `--` to the bun script.
+        /// Extra arguments forwarded after `--` to the script.
         #[arg(last = true)]
         extra: Vec<String>,
     },
 
-    /// Preview the production build (`bun run preview`) in a project directory.
+    /// Preview the production build in a project directory.
     Preview {
         /// Project directory (defaults to the current directory).
         #[arg(default_value = ".")]
         dir: PathBuf,
 
-        /// Extra arguments forwarded after `--` to the bun script.
+        /// Extra arguments forwarded after `--` to the script.
         #[arg(last = true)]
         extra: Vec<String>,
     },
