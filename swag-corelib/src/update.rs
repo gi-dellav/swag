@@ -23,8 +23,16 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Error, Result};
 use crate::provenance::{self, Provenance};
 
-/// Directories never compared or copied (build artefacts, VCS metadata).
-const SKIPPED_DIRS: [&str; 5] = [".git", "node_modules", "target", "dist", ".swag-tmp"];
+/// Directories never compared or copied (build artefacts, VCS metadata,
+/// local Vercel link state).
+const SKIPPED_DIRS: [&str; 6] = [
+    ".git",
+    "node_modules",
+    "target",
+    "dist",
+    ".swag-tmp",
+    ".vercel",
+];
 /// Files managed by swag itself, excluded from the content diff.
 const SKIPPED_FILES: [&str; 1] = [".swag.json"];
 /// Largest file compared byte-for-byte (binary-asset heuristic, mirrors scaffold).

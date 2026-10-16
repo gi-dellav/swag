@@ -16,6 +16,12 @@ pub enum Error {
     #[error("bun not found on PATH (requires bun >= 1.1): {0}")]
     BunNotFound(String),
 
+    /// The `vercel` binary could not be found on PATH.
+    #[error(
+        "vercel not found on PATH (install with `npm i -g vercel` or `bun add -g vercel`, see https://vercel.com/docs/cli): {0}"
+    )]
+    VercelNotFound(String),
+
     /// No home directory could be determined (`$SWAG_HOME` unset and no home found).
     #[error("could not determine swag home directory: {0}")]
     HomeNotFound(String),

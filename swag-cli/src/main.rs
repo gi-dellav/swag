@@ -254,6 +254,68 @@ enum Command {
         #[arg(long)]
         fix: bool,
     },
+
+    /// Deploy a frontend/backend project to Vercel (preview by default).
+    ///
+    /// Thin wrapper over the `vercel` CLI: links the project when needed
+    /// (`vercel link`) then runs `vercel deploy` from the project root, so
+    /// the template's own `vercel.json` (fullstack) or framework
+    /// auto-detection (frontend) drives the remote build. Desktop (Tauri)
+    /// projects are refused. Auth via an existing `vercel login`,
+    /// `VERCEL_TOKEN` in the environment (preferred for CI/agents), or
+    /// `--token`. The first deploy of a new project is always production,
+    /// even without `--prod`.
+    Vc {
+        /// Registered project name or directory (defaults to cwd).
+        #[arg(default_value = ".")]
+        target: String,
+
+        /// Production deploy (`vercel deploy --prod`); default is preview.
+        #[arg(long)]
+        prod: bool,
+
+        /// Skip prompts (`--yes`, forwarded to `link` and `deploy`).
+        #[arg(long)]
+        yes: bool,
+
+        /// Vercel project name or id (`vercel link/deploy --project`).
+        #[arg(long)]
+        project: Option<String>,
+
+        /// Vercel auth token. Also read from the VERCEL_TOKEN environment
+        /// variable (preferred for CI: avoids the token in process lists).
+        #[arg(long, env = "VERCEL_TOKEN")]
+        token: Option<String>,
+
+        /// Vercel scope slug (`--scope`).
+        #[arg(long)]
+        scope: Option<String>,
+
+        /// Vercel team slug or id (`--team`).
+        #[arg(long)]
+        team: Option<String>,
+
+        /// Runtime env var (`--env KEY=val`); repeatable.
+        #[arg(long = "env")]
+        env_vars: Vec<String>,
+
+        /// Build-time env var (`--build-env KEY=val`); repeatable.
+        #[arg(long = "build-env")]
+        build_env: Vec<String>,
+
+        /// Do not wait for the deployment to finish (`--no-wait`).
+        #[arg(long = "no-wait")]
+        no_wait: bool,
+
+        /// Ignore the build cache (`--force`).
+        #[arg(long)]
+        force: bool,
+
+        /// Extra arguments forwarded verbatim after `--` to `vercel deploy`
+        /// (e.g. `-- --regions sfo1 --target=staging`).
+        #[arg(last = true)]
+        extra: Vec<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -636,6 +698,58 @@ fn run() -> Result<(), Error> {
             if check && !report.up_to_date {
                 std::process::exit(1);
             }
+        }
+        Command::Vc {
+            target,
+            prod,
+            yes,
+            project,
+            token,
+            scope,
+            team,
+            env_vars,
+            build_env,
+            no_wait,
+            force,
+            extra,
+        } => {
+            let dir = resolve_update_target(&target)?;
+            let kind = swag_corelib::vercel::detect_kind(&dir)?;
+            for note in swag_corelib::vercel::preflight(&dir, &kind)? {
+                eprintln!("swag vc: note: {note}");
+            }
+            let vercel = swag_corelib::Vercel::new()?;
+            if !swag_corelib::Vercel::is_linked(&dir) {
+                eprintln!("swag vc: not linked yet, running `vercel link` first");
+                vercel.link(
+                    &dir,
+                    &swag_corelib::vercel::LinkOptions {
+                        yes,
+                        project: project.clone(),
+                        token: token.clone(),
+                        scope: scope.clone(),
+                        team: team.clone(),
+                    },
+                )?;
+                eprintln!("swag vc: linked {}", dir.display());
+            }
+            let url = vercel.deploy(
+                &dir,
+                &swag_corelib::vercel::DeployOptions {
+                    prod,
+                    yes,
+                    project,
+                    token,
+                    scope,
+                    team,
+                    env: env_vars,
+                    build_env,
+                    no_wait,
+                    force,
+                    extra,
+                },
+            )?;
+            println!("{url}");
         }
         Command::Doctor { target, json, fix } => {
             let dir = match target {

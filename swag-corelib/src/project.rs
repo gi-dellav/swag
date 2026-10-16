@@ -43,8 +43,9 @@ use crate::custom_templates::{self, ResolvedTemplate, TemplateSource};
 use crate::error::{Error, Result};
 use crate::template::Template;
 
-/// Directories never entered during personalization.
-const SKIPPED_DIRS: [&str; 4] = [".git", "node_modules", "target", "dist"];
+/// Directories never entered during personalization (`.vercel` holds local
+/// link state created by `swag vc`, never template content).
+const SKIPPED_DIRS: [&str; 5] = [".git", "node_modules", "target", "dist", ".vercel"];
 /// Extensions considered text for the rewrite pass.
 const TEXT_EXTENSIONS: [&str; 15] = [
     "json", "md", "html", "ts", "js", "svelte", "toml", "yml", "yaml", "css", "txt", "svg", "xml",
