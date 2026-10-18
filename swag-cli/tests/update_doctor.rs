@@ -30,6 +30,24 @@ fn swag(home: &std::path::Path, args: &[&str]) -> (String, String, i32) {
     )
 }
 
+fn swag_in_dir(
+    home: &std::path::Path,
+    cwd: &std::path::Path,
+    args: &[&str],
+) -> (String, String, i32) {
+    let output = Command::new(env!("CARGO_BIN_EXE_swag"))
+        .env("SWAG_HOME", home)
+        .current_dir(cwd)
+        .args(args)
+        .output()
+        .expect("could not spawn swag binary");
+    (
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+        output.status.code().unwrap_or(-1),
+    )
+}
+
 struct Home {
     dir: PathBuf,
 }
@@ -229,4 +247,140 @@ fn doctor_fix_prunes_stale_entries() {
     let (out, _, code) = home.run(&["projects", "list"]);
     assert_eq!(code, 0, "{out}");
     assert!(!out.contains("gone"), "{out}");
+}
+
+#[test]
+fn update_prune_preserves_user_files() {
+    let home = Home::fresh("prune-user");
+    let src = home.dir.join("tpl");
+    write_template(&src, "21\n", "v1");
+    std::fs::write(src.join("old.txt"), "old").unwrap();
+    let dest = home.dir.join("demo");
+    scaffold_from(&home, &src, &dest);
+
+    std::fs::write(dest.join("notes.txt"), "user data").unwrap();
+    std::fs::remove_file(src.join("old.txt")).unwrap();
+    std::fs::write(src.join("new.txt"), "new").unwrap();
+
+    let (out, err, code) = home.run(&["update", dest.to_str().expect("utf8"), "--prune"]);
+    assert_eq!(code, 0, "{out} {err}");
+    assert!(dest.join("notes.txt").is_file(), "user file must survive");
+    assert!(!dest.join("old.txt").exists(), "template file is pruned");
+    assert!(dest.join("new.txt").is_file(), "new template file is added");
+    assert!(out.contains("D old.txt (deleted)"), "{out}");
+    assert!(!out.contains("old.txt (kept"), "{out}");
+    assert!(out.contains("updated (now"), "{out}");
+
+    let (out, _, code) = home.run(&["update", dest.to_str().expect("utf8"), "--check"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("up to date"), "{out}");
+}
+
+#[test]
+fn update_restores_missing_version_files() {
+    let home = Home::fresh("version-sync");
+    let src = home.dir.join("tpl");
+    write_template(&src, "21\n", "v1");
+    let dest = home.dir.join("demo");
+    scaffold_from(&home, &src, &dest);
+
+    std::fs::remove_file(dest.join(".template_version")).unwrap();
+    std::fs::remove_file(dest.join(".template_type")).unwrap();
+
+    let (out, _, code) = home.run(&["update", dest.to_str().expect("utf8"), "--check"]);
+    assert_eq!(code, 1, "missing version files must count as behind: {out}");
+
+    let (out, _, code) = home.run(&["update", dest.to_str().expect("utf8")]);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(
+        std::fs::read_to_string(dest.join(".template_version")).unwrap(),
+        "21\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dest.join(".template_type")).unwrap(),
+        "frontend\n"
+    );
+
+    let (out, _, code) = home.run(&["update", dest.to_str().expect("utf8"), "--check"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("up to date"), "{out}");
+}
+
+#[test]
+fn update_detects_large_file_changes() {
+    let home = Home::fresh("large-file");
+    let src = home.dir.join("tpl");
+    let v1 = "a".repeat(600 * 1024);
+    write_template(&src, "21\n", &v1);
+    let dest = home.dir.join("demo");
+    scaffold_from(&home, &src, &dest);
+
+    let v2 = format!("{}b", "a".repeat(600 * 1024));
+    std::fs::write(src.join("app.txt"), &v2).unwrap();
+
+    let (out, _, code) = home.run(&["update", dest.to_str().expect("utf8"), "--check"]);
+    assert_eq!(code, 1, "large file change must be detected: {out}");
+
+    let (out, _, code) = home.run(&["update", dest.to_str().expect("utf8")]);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(std::fs::read_to_string(dest.join("app.txt")).unwrap(), v2);
+}
+
+#[test]
+fn doctor_json_with_fix_stays_valid_json() {
+    let home = Home::fresh("doctor-json-fix");
+    let gone = home.dir.join("gone");
+    let (out, _, code) = home.run(&[
+        "projects",
+        "add",
+        "gone",
+        "--path",
+        gone.to_str().expect("utf8"),
+    ]);
+    assert_eq!(code, 0, "{out}");
+
+    let (out, err, code) = home.run(&["doctor", "--json", "--fix"]);
+    assert_eq!(code, 0, "{out} {err}");
+    let parsed: serde_json::Value = serde_json::from_str(&out).expect("stdout must stay JSON");
+    assert!(parsed["checks"].is_array(), "{out}");
+    assert!(err.contains("fix: pruned gone"), "{err}");
+
+    let (out, _, code) = home.run(&["projects", "list"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(!out.contains("gone"), "{out}");
+}
+
+#[test]
+fn registry_name_wins_over_local_path() {
+    let home = Home::fresh("registry-wins");
+    let registered = home.dir.join("registered");
+    std::fs::create_dir_all(&registered).unwrap();
+    std::fs::write(registered.join("package.json"), "{}").unwrap();
+    std::fs::write(registered.join(".template_version"), "21\n").unwrap();
+    std::fs::write(registered.join(".template_type"), "frontend\n").unwrap();
+    let (out, _, code) = home.run(&[
+        "projects",
+        "add",
+        "demo",
+        "--path",
+        registered.to_str().expect("utf8"),
+    ]);
+    assert_eq!(code, 0, "{out}");
+
+    let cwd = home.dir.join("cwd");
+    std::fs::create_dir_all(cwd.join("demo")).unwrap();
+
+    let (out, _, _) = swag_in_dir(&home.dir, &cwd, &["doctor", "demo", "--json"]);
+    let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+    let project_dir = parsed["checks"]
+        .as_array()
+        .expect("checks")
+        .iter()
+        .find(|c| c["name"] == "project-dir")
+        .expect("project-dir check");
+    let message = project_dir["message"].as_str().expect("message");
+    assert!(
+        message.contains(registered.canonicalize().unwrap().to_str().unwrap()),
+        "registry path must win over ./demo: {message}"
+    );
 }

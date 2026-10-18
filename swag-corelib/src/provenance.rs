@@ -41,6 +41,11 @@ pub struct Provenance {
     /// Makes an otherwise unpinned clone reproducible after the fact.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit: Option<String>,
+    /// Relative paths of the template-managed files at the last scaffold or
+    /// update. `swag update --prune` only deletes files listed here that
+    /// disappeared upstream, so user-created files are never pruned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_files: Option<Vec<String>>,
 }
 
 impl Provenance {
@@ -61,6 +66,7 @@ impl Provenance {
             template_type,
             owner: owner.map(str::to_string),
             commit: None,
+            template_files: None,
         }
     }
 }
@@ -68,19 +74,25 @@ impl Provenance {
 /// Load provenance from `dir/.swag.json`.
 pub fn load(dir: &Path) -> Result<Provenance> {
     let path = dir.join(PROVENANCE_FILE);
-    let bytes = fs::read(&path).map_err(|_| {
-        Error::NotAProject(format!(
-            "no {} in '{}' (legacy project: re-scaffold or keep a registry entry)",
-            PROVENANCE_FILE,
-            dir.display()
-        ))
-    })?;
-    serde_json::from_slice(&bytes).map_err(|e| {
-        Error::NotAProject(format!(
-            "{} in '{}' is corrupt: {e}",
-            PROVENANCE_FILE,
-            dir.display()
-        ))
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(Error::NotAProject(format!(
+                "no {} in '{}' (legacy project: re-scaffold or keep a registry entry)",
+                PROVENANCE_FILE,
+                dir.display()
+            )));
+        }
+        Err(e) => {
+            return Err(Error::Io {
+                context: format!("could not read '{}'", path.display()),
+                source: e,
+            });
+        }
+    };
+    serde_json::from_slice(&bytes).map_err(|e| Error::ProvenanceCorrupt {
+        path: path.display().to_string(),
+        reason: e.to_string(),
     })
 }
 
@@ -133,6 +145,21 @@ mod tests {
         ));
         fs::create_dir_all(&dir).unwrap();
         assert!(matches!(load(&dir), Err(Error::NotAProject(_))));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn corrupt_file_is_reported_as_corrupt() {
+        let dir = std::env::temp_dir().join(format!(
+            "swag-prov-corrupt-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(PROVENANCE_FILE), "not json").unwrap();
+        assert!(matches!(load(&dir), Err(Error::ProvenanceCorrupt { .. })));
         fs::remove_dir_all(&dir).unwrap();
     }
 }

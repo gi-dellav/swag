@@ -74,7 +74,7 @@ impl CustomTemplate {
         source: TemplateSource,
     ) -> Result<Self> {
         validate_name(name)?;
-        validate_source(&source)?;
+        let source = normalize_source(source)?;
         Ok(Self {
             name: name.to_string(),
             base,
@@ -145,6 +145,18 @@ pub fn validate_name(name: &str) -> Result<()> {
             "name collides with a built-in template id or alias".to_string(),
         ));
     }
+    // Custom names are rewritten during personalization. A name that is a
+    // substring of a builtin id (e.g. `svelte`, `template`, `clean-template`)
+    // would partially replace that id and corrupt the template content.
+    if Template::ALL
+        .iter()
+        .any(|template| template.id().contains(name) || template.short_alias().contains(name))
+    {
+        return Err(Error::InvalidTemplateName(
+            name.to_string(),
+            "name must not be a substring of a built-in template id or alias".to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -181,15 +193,19 @@ pub(crate) fn validate_git_ref(git_ref: &str) -> Result<()> {
     Ok(())
 }
 
-/// Validate a source; local paths must exist and be directories.
-fn validate_source(source: &TemplateSource) -> Result<()> {
+/// Validate a source and normalize local paths to absolute, canonical paths.
+///
+/// Canonicalizing at registration time is important: the stored path is later
+/// used by `swag new`/`swag update`, which may run from a different working
+/// directory than `swag templates add`.
+fn normalize_source(source: TemplateSource) -> Result<TemplateSource> {
     match source {
         TemplateSource::Git { url, git_ref } => {
-            validate_git_url(url)?;
-            if let Some(git_ref) = git_ref {
+            validate_git_url(&url)?;
+            if let Some(git_ref) = &git_ref {
                 validate_git_ref(git_ref)?;
             }
-            Ok(())
+            Ok(TemplateSource::Git { url, git_ref })
         }
         TemplateSource::Path { path } => {
             if !path.exists() {
@@ -204,15 +220,19 @@ fn validate_source(source: &TemplateSource) -> Result<()> {
                     "path is not a directory".to_string(),
                 ));
             }
-            Ok(())
+            let path = path.canonicalize().map_err(|e| Error::Io {
+                context: format!("could not resolve template path '{}'", path.display()),
+                source: e,
+            })?;
+            Ok(TemplateSource::Path { path })
         }
     }
 }
 
 /// Register a template; with `force` an existing entry is overwritten.
-pub fn add(template: CustomTemplate, force: bool) -> Result<()> {
+pub fn add(mut template: CustomTemplate, force: bool) -> Result<()> {
     validate_name(&template.name)?;
-    validate_source(&template.source)?;
+    template.source = normalize_source(template.source)?;
     let mut registry = load()?;
     if registry.0.contains_key(&template.name) && !force {
         return Err(Error::TemplateExists(template.name));
@@ -332,8 +352,43 @@ mod tests {
         assert!(validate_name("blog-acme").is_ok());
         assert!(validate_name("clean").is_err());
         assert!(validate_name("svelte-clean-template").is_err());
+        assert!(validate_name("svelte").is_err(), "builtin id substring");
+        assert!(validate_name("template").is_err(), "builtin id substring");
+        assert!(
+            validate_name("clean-template").is_err(),
+            "builtin id substring"
+        );
         assert!(validate_name("Has-Upper").is_err());
         assert!(validate_name("").is_err());
+    }
+
+    #[test]
+    fn add_canonicalizes_relative_paths() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old = std::env::var("SWAG_HOME").ok();
+        isolated_home("canonical-path");
+        let tpl = CustomTemplate::new(
+            "blog-dot",
+            Template::SvelteClean,
+            "canonical path test",
+            TemplateSource::Path {
+                path: std::path::PathBuf::from("."),
+            },
+        )
+        .unwrap();
+        add(tpl, false).unwrap();
+        let stored = get("blog-dot").unwrap();
+        match stored.source {
+            TemplateSource::Path { path } => {
+                assert!(path.is_absolute(), "stored path must be absolute: {path:?}");
+                assert_eq!(
+                    path,
+                    std::env::current_dir().unwrap().canonicalize().unwrap()
+                );
+            }
+            other => panic!("expected a path source, got {other:?}"),
+        }
+        restore(old);
     }
 
     #[test]

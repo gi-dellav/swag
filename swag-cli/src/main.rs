@@ -299,9 +299,10 @@ enum Command {
         #[arg(long)]
         project: Option<String>,
 
-        /// Vercel auth token. Also read from the VERCEL_TOKEN environment
-        /// variable (preferred for CI: avoids the token in process lists).
-        #[arg(long, env = "VERCEL_TOKEN")]
+        /// Vercel auth token (`--token`). `VERCEL_TOKEN` in the environment
+        /// is inherited by the vercel CLI (preferred for CI: keeps the token
+        /// out of the child process's argument list).
+        #[arg(long)]
         token: Option<String>,
 
         /// Vercel scope slug (`--scope`).
@@ -511,17 +512,12 @@ fn run() -> Result<(), Error> {
                 template,
                 owner,
             }) => {
-                // Validate the registry name with the most permissive rules;
-                // re-check Rust-bearing templates for dots below.
-                project::validate_project_name(Template::SvelteClean, &name).map_err(|_| {
-                    Error::InvalidName(
-                        name.clone(),
-                        "use letters, digits, '-', '_' or '.'".to_string(),
-                    )
-                })?;
-                if let Ok(resolved) = swag_corelib::custom_templates::resolve_id(&template) {
-                    project::validate_project_name_resolved(&resolved, &name)?;
+                let resolved = swag_corelib::custom_templates::resolve_id(&template)?;
+                project::validate_project_name_resolved(&resolved, &name)?;
+                if let Some(owner) = owner.as_deref() {
+                    project::validate_owner(owner)?;
                 }
+                let template = resolved.id();
                 let previous =
                     swag_corelib::projects::upsert(&name, &path, &template, owner.as_deref())?;
                 let entry = swag_corelib::projects::get(&name)?;
@@ -806,7 +802,11 @@ fn run() -> Result<(), Error> {
             }
             if fix {
                 for line in swag_corelib::doctor::fix()? {
-                    println!("fix: {line}");
+                    if json {
+                        eprintln!("fix: {line}");
+                    } else {
+                        println!("fix: {line}");
+                    }
                 }
             }
             if !report.healthy() {
@@ -1172,16 +1172,10 @@ fn enter_subshell(dir: &Path) -> Result<(), Error> {
     }
 }
 
-/// Resolve an `update`/`doctor` target: `.`/paths directly, otherwise a
-/// registered project name (registry wins, like `swag cd --print`).
+/// Resolve an `update`/`doctor`/`vc` target: a registered project name wins
+/// over an equally-named local path (like `swag cd --print`); otherwise the
+/// target is treated as a filesystem path.
 fn resolve_update_target(target: &str) -> Result<std::path::PathBuf, Error> {
-    if target == "." {
-        return Ok(PathBuf::from("."));
-    }
-    let as_path = Path::new(target);
-    if as_path.exists() {
-        return Ok(as_path.to_path_buf());
-    }
     swag_corelib::update::resolve_target(target)
 }
 
@@ -1201,10 +1195,17 @@ fn print_update_human(report: &swag_corelib::update::UpdateReport, preview: bool
         );
         return;
     }
-    println!(
-        "{} behind (local {local} → upstream {upstream})",
-        report.path.display()
-    );
+    if report.applied {
+        println!(
+            "{} updated (now {local}, upstream {upstream})",
+            report.path.display()
+        );
+    } else {
+        println!(
+            "{} behind (local {local} → upstream {upstream})",
+            report.path.display()
+        );
+    }
     for f in &report.changed {
         println!("  M {f}");
     }
@@ -1212,7 +1213,11 @@ fn print_update_human(report: &swag_corelib::update::UpdateReport, preview: bool
         println!("  A {f}");
     }
     for f in &report.removed {
-        println!("  D {f} (kept; re-run with --prune to delete)");
+        if report.pruned.iter().any(|pruned| pruned == f) {
+            println!("  D {f} (deleted)");
+        } else {
+            println!("  D {f} (kept; re-run with --prune to delete)");
+        }
     }
     if report.applied {
         println!("applied update from {}", report.template);

@@ -226,7 +226,15 @@ pub fn scaffold(options: &ScaffoldOptions) -> Result<Project> {
     let commit = head_commit(&dest);
     let template_ids = resolved_template_ids(&resolved);
     personalize_ids(&dest, &template_ids, &options.name, owner.as_deref())?;
-    write_provenance(&dest, &resolved, &options.name, owner.as_deref(), commit)?;
+    let template_files = template_manifest(&dest)?;
+    write_provenance(
+        &dest,
+        &resolved,
+        &options.name,
+        owner.as_deref(),
+        commit,
+        Some(template_files),
+    )?;
     detach_history(&dest)?;
     if !options.no_git_init {
         git_init(&dest)?;
@@ -263,6 +271,7 @@ fn write_provenance(
     name: &str,
     owner: Option<&str>,
     commit: Option<String>,
+    template_files: Option<Vec<String>>,
 ) -> Result<()> {
     let (template, base) = match resolved {
         ResolvedTemplate::Builtin(t) => (t.id().to_string(), None),
@@ -277,13 +286,84 @@ fn write_provenance(
         owner,
     );
     provenance.commit = commit;
+    provenance.template_files = template_files;
     crate::provenance::save(dest, &provenance)
+}
+
+/// Relative paths of every regular file in a template tree, sorted.
+///
+/// This is the manifest recorded in `.swag.json`: `swag update --prune` only
+/// deletes files that were template-managed before and disappeared upstream,
+/// never files the user created.
+pub(crate) fn template_manifest(root: &Path) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = fs::read_dir(&dir).map_err(|e| Error::Io {
+            context: format!("could not list '{}'", dir.display()),
+            source: e,
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|e| Error::Io {
+                context: format!("could not list '{}'", dir.display()),
+                source: e,
+            })?;
+            let path = entry.path();
+            let file_name = entry.file_name().to_string_lossy().into_owned();
+            let file_type = entry.file_type().map_err(|e| Error::Io {
+                context: format!("could not stat '{}'", path.display()),
+                source: e,
+            })?;
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                if !SKIPPED_DIRS.contains(&file_name.as_str()) {
+                    stack.push(path);
+                }
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+            if file_name == crate::provenance::PROVENANCE_FILE {
+                continue;
+            }
+            let rel = path
+                .strip_prefix(root)
+                .map_err(|e| Error::Internal(format!("could not build template manifest: {e}")))?;
+            if let Some(rel) = rel.to_str() {
+                out.push(rel.to_string());
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
 }
 
 /// Best-effort `git rev-parse HEAD` in `dir`, used to record the exact
 /// upstream revision a project was scaffolded from (templates are cloned
 /// unpinned from the default branch; the commit makes builds reproducible).
+///
+/// `dir` must itself be the repository root: `git` walks parent directories,
+/// so without this check scaffolding a local template into a subdirectory of
+/// an existing repo would record the enclosing repo's HEAD as the template
+/// revision.
 pub(crate) fn head_commit(dir: &Path) -> Option<String> {
+    let top = Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(dir)
+        .output()
+        .ok()?;
+    if !top.status.success() {
+        return None;
+    }
+    let top = PathBuf::from(String::from_utf8_lossy(&top.stdout).trim());
+    let top = top.canonicalize().ok()?;
+    let dir = dir.canonicalize().ok()?;
+    if top != dir {
+        return None;
+    }
     let output = Command::new("git")
         .args(["rev-parse", "HEAD"])
         .current_dir(dir)
@@ -408,7 +488,10 @@ fn resolve_owner(owner: Option<&str>) -> Result<Option<String>> {
 }
 
 /// Ensure `owner` is a plausible GitHub username (see [`resolve_owner`]).
-fn validate_owner(owner: &str) -> Result<()> {
+///
+/// Exposed so `swag projects add --owner` can validate the value it records
+/// (legacy updates use the registry owner for personalization).
+pub fn validate_owner(owner: &str) -> Result<()> {
     let bad = |why: &str| Error::InvalidOwner(owner.to_string(), why.to_string());
     if owner.is_empty() {
         return Err(bad("owner must not be empty"));
@@ -479,6 +562,7 @@ fn prepare_destination(dest: &Path, force: bool, init: bool) -> Result<()> {
         return Err(Error::DestinationExists(dest.display().to_string()));
     }
     if force {
+        ensure_destination_is_safe(dest, init)?;
         if init {
             if non_empty {
                 eprintln!(
@@ -495,6 +579,34 @@ fn prepare_destination(dest: &Path, force: bool, init: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Refuse `--force` targets that would delete the current working directory
+/// or one of its ancestors.
+///
+/// `swag init --force` intentionally empties the current directory (the
+/// directory itself is kept), so equality is allowed for init; for `new` even
+/// equality is refused because the destination is removed and recreated.
+fn ensure_destination_is_safe(dest: &Path, init: bool) -> Result<()> {
+    let cwd = std::env::current_dir().map_err(|e| Error::Io {
+        context: "could not determine current directory".to_string(),
+        source: e,
+    })?;
+    // Canonicalize both sides the same way (on Windows `canonicalize` adds a
+    // verbatim prefix, which would otherwise make the comparison fail).
+    let cwd = canonicalize_lenient(&cwd);
+    let dest = canonicalize_lenient(dest);
+    if destination_is_unsafe(&dest, &cwd, init) {
+        return Err(Error::UnsafeDestination(dest.display().to_string()));
+    }
+    Ok(())
+}
+
+fn destination_is_unsafe(dest: &Path, cwd: &Path, init: bool) -> bool {
+    if dest == cwd {
+        return !init;
+    }
+    cwd.starts_with(dest)
 }
 
 /// Remove every entry inside `dir` while keeping `dir` itself (used by
@@ -562,23 +674,43 @@ fn clone_template_url(url: &str, label: &str, dest: &Path, git_ref: Option<&str>
     Ok(())
 }
 
-/// Copy a local template directory into `dest` (skips `.git` so the new
-/// project starts detached, like the clone path).
+/// Copy a local template directory into `dest` (skips `.git`, dependency
+/// trees, build output and local Vercel link state, like the clone path).
 fn copy_template_dir(src: &Path, label: &str, dest: &Path) -> Result<()> {
+    let src = src.canonicalize().map_err(|e| Error::FetchFailed {
+        template: label.to_string(),
+        reason: format!(
+            "template source '{}' is not a readable directory: {e}",
+            src.display()
+        ),
+    })?;
     if !src.is_dir() {
         return Err(Error::FetchFailed {
             template: label.to_string(),
             reason: format!("template source '{}' is not a directory", src.display()),
         });
     }
+    // Copying a template into a directory inside itself would recurse
+    // forever (the destination is discovered by the source walk).
+    let dest_abs = canonicalize_lenient(&absolute_path(dest)?);
+    if dest_abs == src || dest_abs.starts_with(&src) {
+        return Err(Error::FetchFailed {
+            template: label.to_string(),
+            reason: format!(
+                "destination '{}' is inside the template source '{}'",
+                dest.display(),
+                src.display()
+            ),
+        });
+    }
     fs::create_dir_all(dest).map_err(|e| Error::Io {
         context: format!("could not create '{}'", dest.display()),
         source: e,
     })?;
-    let mut stack = vec![src.to_path_buf()];
+    let mut stack = vec![src.clone()];
     while let Some(dir) = stack.pop() {
         let rel = dir
-            .strip_prefix(src)
+            .strip_prefix(&src)
             .map_err(|e| Error::CommandFailed(format!("could not copy template directory: {e}")))?;
         let target_dir = dest.join(rel);
         fs::create_dir_all(&target_dir).map_err(|e| Error::Io {
@@ -602,10 +734,13 @@ fn copy_template_dir(src: &Path, label: &str, dest: &Path) -> Result<()> {
             if file_type.is_symlink() {
                 continue;
             }
-            let rel = path.strip_prefix(src).map_err(|e| {
+            let rel = path.strip_prefix(&src).map_err(|e| {
                 Error::CommandFailed(format!("could not copy template directory: {e}"))
             })?;
-            if rel.components().any(|c| c.as_os_str() == ".git") {
+            if rel.components().any(|c| {
+                let name = c.as_os_str().to_string_lossy();
+                SKIPPED_DIRS.contains(&name.as_ref())
+            }) {
                 continue;
             }
             let target = dest.join(rel);
@@ -620,6 +755,51 @@ fn copy_template_dir(src: &Path, label: &str, dest: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Absolute, lexically-normalized form of `path` (does not resolve symlinks).
+fn absolute_path(path: &Path) -> Result<PathBuf> {
+    let base = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| Error::Io {
+                context: "could not determine current directory".to_string(),
+                source: e,
+            })?
+            .join(path)
+    };
+    let mut out = PathBuf::new();
+    for component in base.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    Ok(out)
+}
+
+/// Canonicalize `path` even when it does not exist yet by resolving the
+/// deepest existing ancestor and appending the remaining components.
+fn canonicalize_lenient(path: &Path) -> PathBuf {
+    let mut current = path.to_path_buf();
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        if let Ok(mut resolved) = current.canonicalize() {
+            for name in tail.iter().rev() {
+                resolved.push(name);
+            }
+            return resolved;
+        }
+        let (Some(parent), Some(name)) = (current.parent(), current.file_name()) else {
+            return path.to_path_buf();
+        };
+        tail.push(name.to_os_string());
+        current = parent.to_path_buf();
+    }
 }
 
 /// Template author handle baked into the templates: `gi-dellav` in repo
@@ -717,12 +897,80 @@ fn replacement_table_ids(
     table
 }
 
+/// Apply all replacements in one left-to-right pass, preferring the longest
+/// pattern at each position and never re-scanning inserted replacement text.
+///
+/// Sequential `str::replace` calls are unsafe here: a short custom template
+/// name (e.g. `app`) would rewrite parts of unrelated words and file names,
+/// and a custom name that is a prefix of the base id would corrupt the base
+/// id before its own longer replacement had a chance to match.
 fn apply_replacements(content: &str, replacements: &[(String, String)]) -> String {
-    let mut out = content.to_string();
-    for (from, to) in replacements {
-        out = out.replace(from, to);
+    let mut patterns: Vec<&(String, String)> = replacements
+        .iter()
+        .filter(|(from, _)| !from.is_empty())
+        .collect();
+    // Longest first so `svelte-clean-template` wins over `svelte-clean`.
+    patterns.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+    if patterns.is_empty() {
+        return content.to_string();
+    }
+    let mut out = String::with_capacity(content.len());
+    let mut cursor = 0;
+    while cursor < content.len() {
+        let rest = &content[cursor..];
+        let mut best: Option<(usize, &str, &str)> = None;
+        for (from, to) in &patterns {
+            for (rel, _) in rest.match_indices(from.as_str()) {
+                let start = cursor + rel;
+                let end = start + from.len();
+                if !replacement_boundaries_ok(content, start, end, from) {
+                    continue;
+                }
+                let wins = match best {
+                    None => true,
+                    Some((best_rel, best_from, _)) => {
+                        rel < best_rel || (rel == best_rel && from.len() > best_from.len())
+                    }
+                };
+                if wins {
+                    best = Some((rel, from.as_str(), to.as_str()));
+                }
+                break;
+            }
+        }
+        match best {
+            Some((rel, from, to)) => {
+                out.push_str(&content[cursor..cursor + rel]);
+                out.push_str(to);
+                cursor += rel + from.len();
+            }
+            None => {
+                let ch = content[cursor..]
+                    .chars()
+                    .next()
+                    .expect("cursor is inside content");
+                out.push(ch);
+                cursor += ch.len_utf8();
+            }
+        }
     }
     out
+}
+
+/// Only rewrite complete tokens: `app` must not match `application` or
+/// `app.css`, and `svelte-clean-template` must not match a longer
+/// `svelte-clean-template-fork`. Multi-word ids, snake/kebab ids and the
+/// owner tokens may sit next to dots (URLs, bundle identifiers).
+fn replacement_boundaries_ok(content: &str, start: usize, end: usize, pattern: &str) -> bool {
+    let allow_dot = pattern.contains('-')
+        || pattern.contains('_')
+        || pattern.contains(' ')
+        || pattern == TEMPLATE_OWNER
+        || pattern == TEMPLATE_OWNER_COMPACT;
+    let is_bad = |c: char| c.is_alphanumeric() || c == '_' || c == '-' || (!allow_dot && c == '.');
+    let before = content[..start].chars().next_back();
+    let after = content[end..].chars().next();
+    before.is_none_or(|c| !is_bad(c)) && after.is_none_or(|c| !is_bad(c))
 }
 
 /// "svelte-clean-template" → "Svelte Clean Template".
@@ -1112,6 +1360,9 @@ repository = "https://github.com/gi-dellav/svelte-clean-template"
         };
         scaffold(&options).unwrap();
         assert!(dest.join("package.json").is_file());
+        let prov = crate::provenance::load(&dest).unwrap();
+        let files = prov.template_files.expect("manifest must be recorded");
+        assert!(files.contains(&"package.json".to_string()), "{files:?}");
 
         restore_home(&home, old);
         let _ = fs::remove_dir_all(&src);
@@ -1183,5 +1434,161 @@ repository = "https://github.com/gi-dellav/svelte-clean-template"
         restore_home(&home, old);
         let _ = fs::remove_dir_all(&src);
         let _ = fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn destination_guard_rejects_cwd_and_ancestors() {
+        let base = stamp("guard");
+        let child = base.join("child");
+        let sibling = base.join("sibling");
+        fs::create_dir_all(&child).unwrap();
+        fs::create_dir_all(&sibling).unwrap();
+
+        assert!(
+            destination_is_unsafe(&base, &child, false),
+            "ancestor of cwd"
+        );
+        assert!(
+            destination_is_unsafe(&child, &child, false),
+            "cwd itself for new"
+        );
+        assert!(
+            !destination_is_unsafe(&child, &child, true),
+            "init --force may empty cwd"
+        );
+        assert!(
+            destination_is_unsafe(&base, &child, true),
+            "init must not clear an ancestor of cwd"
+        );
+        assert!(
+            !destination_is_unsafe(&sibling, &child, false),
+            "sibling is safe"
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn replacements_are_longest_first_and_token_aware() {
+        let table = replacement_table_ids(
+            &[
+                "svelte-clean".to_string(),
+                "svelte-clean-template".to_string(),
+            ],
+            "demo-app",
+            None,
+        );
+        let content = r#"{"name":"svelte-clean-template"} application app.css svelte-clean"#;
+        let out = apply_replacements(content, &table);
+        assert!(out.contains(r#""demo-app""#), "{out}");
+        assert!(out.contains("demo-app"), "{out}");
+        assert!(out.contains("application"), "{out}");
+        assert!(out.contains("app.css"), "{out}");
+        assert!(!out.contains("svelte-clean"), "{out}");
+    }
+
+    #[test]
+    fn short_custom_names_do_not_corrupt_words_or_extensions() {
+        let table = replacement_table_ids(&["app".to_string()], "demo", None);
+        let out = apply_replacements("application app.css \"app\" App", &table);
+        assert!(out.contains("application"), "{out}");
+        assert!(out.contains("app.css"), "{out}");
+        assert!(out.contains("\"demo\""), "{out}");
+        assert!(out.contains("Demo"), "{out}");
+    }
+
+    #[test]
+    fn owner_replacement_still_works_in_domains_and_identifiers() {
+        let table = replacement_table_ids(
+            &[Template::SvelteClean.id().to_string()],
+            "demo",
+            Some("octo-cat"),
+        );
+        let out = apply_replacements(
+            "https://gi-dellav.github.io/x com.gidellav.svelte_clean_template",
+            &table,
+        );
+        assert!(out.contains("https://octo-cat.github.io/x"), "{out}");
+        assert!(out.contains("com.octocat.demo"), "{out}");
+    }
+
+    #[test]
+    fn copy_template_dir_skips_build_artifacts_and_vercel_state() {
+        let src = stamp("copy-src");
+        let dest = stamp("copy-dest");
+        fs::create_dir_all(src.join("src")).unwrap();
+        for skipped in ["node_modules", "target", "dist", ".vercel"] {
+            fs::create_dir_all(src.join(skipped)).unwrap();
+            fs::write(src.join(skipped).join("artifact.txt"), "x").unwrap();
+        }
+        fs::write(src.join("package.json"), "{}").unwrap();
+        fs::write(src.join("src").join("keep.txt"), "keep").unwrap();
+
+        copy_template_dir(&src, "tpl", &dest).unwrap();
+
+        assert!(dest.join("package.json").is_file());
+        assert!(dest.join("src").join("keep.txt").is_file());
+        for skipped in ["node_modules", "target", "dist", ".vercel"] {
+            assert!(!dest.join(skipped).exists(), "{skipped} must be skipped");
+        }
+        let _ = fs::remove_dir_all(&src);
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn copy_template_dir_refuses_destination_inside_source() {
+        let src = stamp("copy-self-src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("package.json"), "{}").unwrap();
+        let dest = src.join("out");
+
+        let err = copy_template_dir(&src, "tpl", &dest).unwrap_err();
+        assert!(
+            err.to_string().contains("inside the template source"),
+            "{err}"
+        );
+        assert!(!dest.exists(), "must refuse before creating anything");
+        let _ = fs::remove_dir_all(&src);
+    }
+
+    #[test]
+    fn head_commit_ignores_enclosing_repository() {
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let repo = stamp("head-repo");
+        let nested = repo.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(&repo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=test@example.com",
+                    "-c",
+                    "user.name=Test",
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    "init",
+                ])
+                .current_dir(&repo)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        assert!(head_commit(&repo).is_some());
+        assert!(
+            head_commit(&nested).is_none(),
+            "nested dir must not inherit the parent repo's HEAD"
+        );
+        let _ = fs::remove_dir_all(&repo);
     }
 }

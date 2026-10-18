@@ -204,3 +204,28 @@ fn vc_skips_link_when_already_linked() {
     assert!(!log.contains("link"), "link must be skipped: {log}");
     assert!(log.contains("deploy --prod --yes"), "{log}");
 }
+
+#[test]
+#[cfg(unix)]
+fn vc_env_token_is_not_forwarded_in_argv() {
+    let home = Home::fresh("env-token");
+    let (_bin, path) = install_stub_vercel(&home);
+    let dest = home.dir.join("demo");
+    write_frontend(&dest, true);
+    let home_dir = home.dir.clone();
+    let (out, err, code) = swag_with_env(
+        &home_dir,
+        &["vc", dest.to_str().expect("utf8"), "--yes"],
+        &[
+            ("PATH", path.as_str()),
+            ("VERCEL_TOKEN", "top-secret-token"),
+        ],
+    );
+    assert_eq!(code, 0, "stdout: {out}\nstderr: {err}");
+    let log = std::fs::read_to_string(dest.join("vercel-calls.log")).unwrap();
+    assert!(
+        !log.contains("top-secret-token"),
+        "token must stay out of argv: {log}"
+    );
+    assert!(log.contains("deploy"), "{log}");
+}

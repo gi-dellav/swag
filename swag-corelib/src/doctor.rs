@@ -188,6 +188,13 @@ fn check_project(dir: &Path) -> Vec<Check> {
             "pass an existing project directory or registered name",
         )];
     }
+    if !dir.is_dir() {
+        return vec![Check::fail(
+            "project-dir",
+            format!("'{}' is not a directory", dir.display()),
+            "pass a project directory or registered name",
+        )];
+    }
     out.push(Check::ok("project-dir", format!("{}", dir.display())));
 
     match crate::provenance::load(dir) {
@@ -195,10 +202,15 @@ fn check_project(dir: &Path) -> Vec<Check> {
             "project-provenance",
             format!("{} from {}", prov.name, prov.template),
         )),
-        Err(_) => out.push(Check::warn(
+        Err(crate::error::Error::NotAProject(_)) => out.push(Check::warn(
             "project-provenance",
             "no .swag.json (legacy project)",
             "use `swag update --dry-run` with a registry entry, or re-scaffold",
+        )),
+        Err(e) => out.push(Check::fail(
+            "project-provenance",
+            format!("{e}"),
+            "fix or delete .swag.json, then re-run `swag doctor`",
         )),
     }
 
@@ -255,11 +267,15 @@ fn type_check(dir: &Path, out: &mut Vec<Check>) {
                 }
                 if kind == crate::template::TemplateType::Desktop
                     && !dir.join("src-tauri").join("tauri.conf.json").exists()
-                    && !dir.join("src-tauri").exists()
                 {
+                    let message = if dir.join("src-tauri").is_dir() {
+                        "desktop project without src-tauri/tauri.conf.json"
+                    } else {
+                        "desktop project without src-tauri/"
+                    };
                     out.push(Check::warn(
                         "project-tauri",
-                        "desktop project without src-tauri/",
+                        message,
                         "check the template ships src-tauri/tauri.conf.json",
                     ));
                 }
@@ -406,5 +422,57 @@ mod tests {
         for name in ["bun", "git", "cargo", "home"] {
             assert!(report.checks.iter().any(|c| c.name == name), "{name}");
         }
+    }
+
+    #[test]
+    fn desktop_without_tauri_conf_warns() {
+        let dir = stamp("desktop-no-conf");
+        std::fs::create_dir_all(dir.join("src-tauri")).unwrap();
+        std::fs::write(dir.join("package.json"), "{}").unwrap();
+        std::fs::write(dir.join(".template_version"), "21\n").unwrap();
+        std::fs::write(dir.join(".template_type"), "desktop\n").unwrap();
+        let report = doctor(Some(&dir));
+        let check = report
+            .checks
+            .iter()
+            .find(|c| c.name == "project-tauri")
+            .expect("project-tauri check");
+        assert_eq!(check.status, Status::Warn, "{check:?}");
+        assert!(check.message.contains("tauri.conf.json"), "{check:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn file_target_is_not_a_project_directory() {
+        let file = stamp("file-target");
+        std::fs::write(&file, "not a directory").unwrap();
+        let report = doctor(Some(&file));
+        let check = report
+            .checks
+            .iter()
+            .find(|c| c.name == "project-dir")
+            .expect("project-dir check");
+        assert_eq!(check.status, Status::Fail, "{check:?}");
+        assert!(check.message.contains("not a directory"), "{check:?}");
+        std::fs::remove_file(&file).unwrap();
+    }
+
+    #[test]
+    fn corrupt_provenance_fails() {
+        let dir = stamp("corrupt-prov");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("package.json"), "{}").unwrap();
+        std::fs::write(dir.join(".template_version"), "21\n").unwrap();
+        std::fs::write(dir.join(".template_type"), "frontend\n").unwrap();
+        std::fs::write(dir.join(".swag.json"), "not json").unwrap();
+        let report = doctor(Some(&dir));
+        let check = report
+            .checks
+            .iter()
+            .find(|c| c.name == "project-provenance")
+            .expect("project-provenance check");
+        assert_eq!(check.status, Status::Fail, "{check:?}");
+        assert!(check.message.contains("corrupt"), "{check:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

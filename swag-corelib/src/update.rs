@@ -13,8 +13,11 @@
 //! on a dirty git tree unless `--force`; removed upstream files are only
 //! deleted with `--prune` (otherwise reported for manual handling).
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::hash::Hasher;
+use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -35,8 +38,6 @@ const SKIPPED_DIRS: [&str; 6] = [
 ];
 /// Files managed by swag itself, excluded from the content diff.
 const SKIPPED_FILES: [&str; 1] = [".swag.json"];
-/// Largest file compared byte-for-byte (binary-asset heuristic, mirrors scaffold).
-const MAX_DIFF_BYTES: u64 = 512 * 1024;
 
 /// Options controlling [`update`].
 #[derive(Debug, Clone)]
@@ -73,8 +74,11 @@ pub struct UpdateReport {
     pub changed: Vec<String>,
     /// Files present upstream but missing in the project.
     pub added: Vec<String>,
-    /// Files present in the project but gone upstream.
+    /// Template-managed files present in the project but gone upstream.
     pub removed: Vec<String>,
+    /// Files actually deleted by `--prune`.
+    #[serde(default)]
+    pub pruned: Vec<String>,
     /// Whether files were actually written.
     pub applied: bool,
 }
@@ -111,6 +115,12 @@ pub fn update(options: &UpdateOptions) -> Result<UpdateReport> {
         ))
     })?;
     let local_version = crate::template::read_template_version(&dir);
+    let prior_files: BTreeSet<String> = provenance
+        .template_files
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
 
     // Fetch + personalize once; the temp dir is reused for the copy step so
     // the template is cloned a single time per `update` run.
@@ -122,12 +132,18 @@ pub fn update(options: &UpdateOptions) -> Result<UpdateReport> {
         crate::project::personalize_ids(&tmp, &ids, &provenance.name, provenance.owner.as_deref())?;
         let upstream_version = crate::template::read_template_version(&tmp);
         let upstream_commit = crate::project::head_commit(&tmp);
-        let (changed, added, removed) = diff_trees(&tmp, &dir)?;
+        let fresh_files = crate::project::template_manifest(&tmp)?;
+        let (changed, added, removed) = diff_trees(&tmp, &dir, &prior_files)?;
+        // Missing/different `.template_version` / `.template_type` files are
+        // synced silently (they are not listed in `changed`/`added`), but
+        // they still mean the project is not up to date.
+        let version_sync_needed = version_files_need_sync(&tmp, &dir);
 
         // The content diff is ground truth: a clean diff means up to date
         // even when `.template_version` was not bumped. Version numbers are
         // reported for information only.
-        let up_to_date = changed.is_empty() && added.is_empty() && removed.is_empty();
+        let up_to_date =
+            changed.is_empty() && added.is_empty() && removed.is_empty() && !version_sync_needed;
 
         let read_only = options.check_only || options.dry_run;
         if read_only || up_to_date {
@@ -140,6 +156,7 @@ pub fn update(options: &UpdateOptions) -> Result<UpdateReport> {
                 changed,
                 added,
                 removed,
+                pruned: Vec::new(),
                 applied: false,
             });
         }
@@ -160,6 +177,7 @@ pub fn update(options: &UpdateOptions) -> Result<UpdateReport> {
                 source: e,
             })?;
         }
+        let mut pruned = Vec::new();
         if options.prune {
             for rel in &removed {
                 let dst = dir.join(rel);
@@ -168,31 +186,35 @@ pub fn update(options: &UpdateOptions) -> Result<UpdateReport> {
                         context: format!("could not remove '{}'", dst.display()),
                         source: e,
                     })?;
+                    pruned.push(rel.clone());
                 }
             }
         }
         sync_version_file(&tmp, &dir)?;
+        let final_version = crate::template::read_template_version(&dir);
         let mut updated = Provenance::new(
             &provenance.name,
             &provenance.template,
             provenance.base.as_deref(),
-            crate::template::read_template_version(&dir),
+            final_version,
             crate::template::read_template_type(&dir),
             provenance.owner.as_deref(),
         );
         // Pin the freshly fetched revision, falling back to the recorded one.
         updated.commit = upstream_commit.or_else(|| provenance.commit.clone());
+        updated.template_files = Some(fresh_files);
         provenance::save(&dir, &updated)?;
 
         Ok(UpdateReport {
             path: dir.clone(),
             template: provenance.template.clone(),
-            local_version,
+            local_version: final_version,
             upstream_version,
             up_to_date: false,
             changed,
             added,
             removed,
+            pruned,
             applied: true,
         })
     })();
@@ -203,8 +225,13 @@ pub fn update(options: &UpdateOptions) -> Result<UpdateReport> {
 /// Load `.swag.json`, or infer provenance for legacy projects from the
 /// version/type files plus a reverse registry lookup by path.
 fn load_or_infer(dir: &Path) -> Result<Provenance> {
-    if let Ok(prov) = provenance::load(dir) {
-        return Ok(prov);
+    match provenance::load(dir) {
+        Ok(prov) => return Ok(prov),
+        // No provenance file: legacy project, infer from metadata/registry.
+        Err(Error::NotAProject(_)) => {}
+        // A corrupt or unreadable provenance file must not be silently
+        // treated as a legacy project (that could update the wrong template).
+        Err(e) => return Err(e),
     }
     let version = crate::template::read_template_version(dir);
     let template_type = crate::template::read_template_type(dir);
@@ -315,7 +342,29 @@ fn sync_version_file(tmp: &Path, dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn snapshot_tree(root: &Path) -> Result<BTreeMap<String, Vec<u8>>> {
+/// Whether a version/type file exists upstream and is missing or different in
+/// the project. These files are synced silently, so this is folded into
+/// `up_to_date` separately from the reported content diff.
+fn version_files_need_sync(tmp: &Path, dir: &Path) -> bool {
+    for file in [
+        crate::template::TEMPLATE_VERSION_FILE,
+        crate::template::TEMPLATE_TYPE_FILE,
+    ] {
+        let src = tmp.join(file);
+        let Ok(upstream) = fs::read(&src) else {
+            continue;
+        };
+        match fs::read(dir.join(file)) {
+            Ok(local) if local == upstream => {}
+            _ => return true,
+        }
+    }
+    false
+}
+
+type FileFingerprint = (u64, u64);
+
+fn snapshot_tree(root: &Path) -> Result<BTreeMap<String, FileFingerprint>> {
     let mut out = BTreeMap::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -357,22 +406,47 @@ fn snapshot_tree(root: &Path) -> Result<BTreeMap<String, Vec<u8>>> {
             {
                 continue;
             }
-            let bytes = fs::read(&path).map_err(|e| Error::Io {
-                context: format!("could not read '{}'", path.display()),
-                source: e,
-            })?;
-            if bytes.len() as u64 > MAX_DIFF_BYTES {
-                continue;
-            }
+            // Hash every file, including large assets: skipping big files
+            // made `update` report stale projects as up to date and silently
+            // ignored large new template files.
+            let fingerprint = fingerprint_file(&path)?;
             if let Some(rel_str) = rel.to_str() {
-                out.insert(rel_str.to_string(), bytes);
+                out.insert(rel_str.to_string(), fingerprint);
             }
         }
     }
     Ok(out)
 }
 
-fn diff_trees(fresh: &Path, project: &Path) -> Result<(Vec<String>, Vec<String>, Vec<String>)> {
+/// Length + content hash for one file (streamed, so large files are fine).
+fn fingerprint_file(path: &Path) -> Result<FileFingerprint> {
+    let file = fs::File::open(path).map_err(|e| Error::Io {
+        context: format!("could not read '{}'", path.display()),
+        source: e,
+    })?;
+    let mut reader = BufReader::new(file);
+    let mut hasher = DefaultHasher::new();
+    let mut buffer = [0u8; 64 * 1024];
+    let mut len = 0u64;
+    loop {
+        let read = reader.read(&mut buffer).map_err(|e| Error::Io {
+            context: format!("could not read '{}'", path.display()),
+            source: e,
+        })?;
+        if read == 0 {
+            break;
+        }
+        hasher.write(&buffer[..read]);
+        len += read as u64;
+    }
+    Ok((len, hasher.finish()))
+}
+
+fn diff_trees(
+    fresh: &Path,
+    project: &Path,
+    prior_files: &BTreeSet<String>,
+) -> Result<(Vec<String>, Vec<String>, Vec<String>)> {
     let fresh_map = snapshot_tree(fresh)?;
     let project_map = snapshot_tree(project)?;
     let fresh_keys: BTreeSet<&String> = fresh_map.keys().collect();
@@ -396,7 +470,12 @@ fn diff_trees(fresh: &Path, project: &Path) -> Result<(Vec<String>, Vec<String>,
         added.push((*key).clone());
     }
     for key in project_keys.difference(&fresh_keys) {
-        removed.push((*key).clone());
+        // Only files that were template-managed at the last scaffold/update
+        // count as "removed upstream". User-created files must never be
+        // reported or pruned.
+        if prior_files.contains(*key) {
+            removed.push((*key).clone());
+        }
     }
     Ok((changed, added, removed))
 }
@@ -655,6 +734,263 @@ mod tests {
         assert_eq!(check.local_version, Some(21));
         assert_eq!(check.upstream_version, Some(21));
         assert!(check.changed.contains(&"app.txt".to_string()), "{check:?}");
+
+        unsafe {
+            match old {
+                Some(v) => std::env::set_var("SWAG_HOME", v),
+                None => std::env::remove_var("SWAG_HOME"),
+            }
+        }
+        let _ = fs::remove_dir_all(&home);
+        let _ = fs::remove_dir_all(&src);
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn restores_missing_version_and_type_files() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old = std::env::var("SWAG_HOME").ok();
+        let home = stamp("home-version");
+        unsafe { std::env::set_var("SWAG_HOME", &home) };
+
+        let src = stamp("src-version");
+        write_template_source(&src, "21\n", "v1");
+        register_custom("tpl-upd-version", &src);
+        let dest = stamp("dest-version");
+        crate::project::scaffold(&crate::ScaffoldOptions {
+            template: "tpl-upd-version".to_string(),
+            name: "demo".to_string(),
+            destination: Some(dest.clone()),
+            git_ref: None,
+            force: false,
+            owner: None,
+            no_install: true,
+            no_git_init: true,
+            init: false,
+        })
+        .unwrap();
+
+        fs::remove_file(dest.join(crate::template::TEMPLATE_VERSION_FILE)).unwrap();
+        fs::remove_file(dest.join(crate::template::TEMPLATE_TYPE_FILE)).unwrap();
+
+        let check = update(&UpdateOptions {
+            dir: dest.clone(),
+            check_only: true,
+            dry_run: false,
+            force: false,
+            prune: false,
+            git_ref: None,
+        })
+        .unwrap();
+        assert!(!check.up_to_date, "{check:?}");
+        assert!(!check.applied);
+
+        let applied = update(&UpdateOptions {
+            dir: dest.clone(),
+            check_only: false,
+            dry_run: false,
+            force: false,
+            prune: false,
+            git_ref: None,
+        })
+        .unwrap();
+        assert!(applied.applied, "{applied:?}");
+        assert_eq!(
+            fs::read_to_string(dest.join(crate::template::TEMPLATE_VERSION_FILE)).unwrap(),
+            "21\n"
+        );
+        assert_eq!(
+            fs::read_to_string(dest.join(crate::template::TEMPLATE_TYPE_FILE)).unwrap(),
+            "frontend\n"
+        );
+
+        let again = update(&UpdateOptions {
+            dir: dest.clone(),
+            check_only: true,
+            dry_run: false,
+            force: false,
+            prune: false,
+            git_ref: None,
+        })
+        .unwrap();
+        assert!(again.up_to_date, "{again:?}");
+
+        unsafe {
+            match old {
+                Some(v) => std::env::set_var("SWAG_HOME", v),
+                None => std::env::remove_var("SWAG_HOME"),
+            }
+        }
+        let _ = fs::remove_dir_all(&home);
+        let _ = fs::remove_dir_all(&src);
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn prune_only_deletes_previous_template_files() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old = std::env::var("SWAG_HOME").ok();
+        let home = stamp("home-prune");
+        unsafe { std::env::set_var("SWAG_HOME", &home) };
+
+        let src = stamp("src-prune");
+        write_template_source(&src, "21\n", "v1");
+        fs::write(src.join("old.txt"), "old").unwrap();
+        register_custom("tpl-upd-prune", &src);
+        let dest = stamp("dest-prune");
+        crate::project::scaffold(&crate::ScaffoldOptions {
+            template: "tpl-upd-prune".to_string(),
+            name: "demo".to_string(),
+            destination: Some(dest.clone()),
+            git_ref: None,
+            force: false,
+            owner: None,
+            no_install: true,
+            no_git_init: true,
+            init: false,
+        })
+        .unwrap();
+
+        fs::write(dest.join("notes.txt"), "user data").unwrap();
+        fs::remove_file(src.join("old.txt")).unwrap();
+        fs::write(src.join("new.txt"), "new").unwrap();
+
+        let report = update(&UpdateOptions {
+            dir: dest.clone(),
+            check_only: false,
+            dry_run: false,
+            force: false,
+            prune: true,
+            git_ref: None,
+        })
+        .unwrap();
+
+        assert!(dest.join("notes.txt").is_file(), "user file must survive");
+        assert!(!dest.join("old.txt").exists(), "template file is pruned");
+        assert!(dest.join("new.txt").is_file(), "new template file added");
+        assert_eq!(report.pruned, vec!["old.txt".to_string()]);
+        assert!(report.removed.contains(&"old.txt".to_string()));
+        assert!(!report.removed.contains(&"notes.txt".to_string()));
+
+        unsafe {
+            match old {
+                Some(v) => std::env::set_var("SWAG_HOME", v),
+                None => std::env::remove_var("SWAG_HOME"),
+            }
+        }
+        let _ = fs::remove_dir_all(&home);
+        let _ = fs::remove_dir_all(&src);
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn prune_without_manifest_is_conservative() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old = std::env::var("SWAG_HOME").ok();
+        let home = stamp("home-nomanifest");
+        unsafe { std::env::set_var("SWAG_HOME", &home) };
+
+        let src = stamp("src-nomanifest");
+        write_template_source(&src, "21\n", "v1");
+        fs::write(src.join("old.txt"), "old").unwrap();
+        register_custom("tpl-upd-nomanifest", &src);
+        let dest = stamp("dest-nomanifest");
+        crate::project::scaffold(&crate::ScaffoldOptions {
+            template: "tpl-upd-nomanifest".to_string(),
+            name: "demo".to_string(),
+            destination: Some(dest.clone()),
+            git_ref: None,
+            force: false,
+            owner: None,
+            no_install: true,
+            no_git_init: true,
+            init: false,
+        })
+        .unwrap();
+
+        // Simulate a project scaffolded by an older swag without a manifest.
+        let mut prov = crate::provenance::load(&dest).unwrap();
+        prov.template_files = None;
+        crate::provenance::save(&dest, &prov).unwrap();
+        fs::remove_file(src.join("old.txt")).unwrap();
+        fs::write(src.join("new.txt"), "new").unwrap();
+
+        let report = update(&UpdateOptions {
+            dir: dest.clone(),
+            check_only: false,
+            dry_run: false,
+            force: false,
+            prune: true,
+            git_ref: None,
+        })
+        .unwrap();
+        assert!(report.pruned.is_empty(), "{report:?}");
+        assert!(
+            dest.join("old.txt").is_file(),
+            "without a manifest, prune must not delete anything"
+        );
+
+        unsafe {
+            match old {
+                Some(v) => std::env::set_var("SWAG_HOME", v),
+                None => std::env::remove_var("SWAG_HOME"),
+            }
+        }
+        let _ = fs::remove_dir_all(&home);
+        let _ = fs::remove_dir_all(&src);
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn detects_and_applies_large_file_changes() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old = std::env::var("SWAG_HOME").ok();
+        let home = stamp("home-large");
+        unsafe { std::env::set_var("SWAG_HOME", &home) };
+
+        let src = stamp("src-large");
+        let v1 = "a".repeat(600 * 1024);
+        write_template_source(&src, "21\n", &v1);
+        register_custom("tpl-upd-large", &src);
+        let dest = stamp("dest-large");
+        crate::project::scaffold(&crate::ScaffoldOptions {
+            template: "tpl-upd-large".to_string(),
+            name: "demo".to_string(),
+            destination: Some(dest.clone()),
+            git_ref: None,
+            force: false,
+            owner: None,
+            no_install: true,
+            no_git_init: true,
+            init: false,
+        })
+        .unwrap();
+
+        let v2 = format!("{}b", "a".repeat(600 * 1024));
+        fs::write(src.join("app.txt"), &v2).unwrap();
+
+        let check = update(&UpdateOptions {
+            dir: dest.clone(),
+            check_only: true,
+            dry_run: false,
+            force: false,
+            prune: false,
+            git_ref: None,
+        })
+        .unwrap();
+        assert!(!check.up_to_date, "{check:?}");
+        assert!(check.changed.contains(&"app.txt".to_string()), "{check:?}");
+
+        update(&UpdateOptions {
+            dir: dest.clone(),
+            check_only: false,
+            dry_run: false,
+            force: false,
+            prune: false,
+            git_ref: None,
+        })
+        .unwrap();
+        assert_eq!(fs::read_to_string(dest.join("app.txt")).unwrap(), v2);
 
         unsafe {
             match old {

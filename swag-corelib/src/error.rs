@@ -68,11 +68,26 @@ pub enum Error {
     #[error("destination '{0}' already exists (use --force to overwrite)")]
     DestinationExists(String),
 
+    /// `--force` would delete the current directory or one of its ancestors.
+    #[error(
+        "refusing to remove unsafe destination '{0}': it is the current directory or contains it"
+    )]
+    UnsafeDestination(String),
+
     /// The destination directory does not exist and `swag init` needs one.
     #[error(
         "destination '{0}' is not a pre-existing directory (swag init scaffolds into an existing directory; use `swag new` to create one)"
     )]
     DestinationMissing(String),
+
+    /// A `.swag.json` provenance file exists but is not valid JSON.
+    #[error("provenance '{path}' is corrupt: {reason} (fix or delete it)")]
+    ProvenanceCorrupt {
+        /// Path of the corrupt provenance file.
+        path: String,
+        /// Human-readable reason.
+        reason: String,
+    },
 
     /// A directory is not a swag project (missing provenance or unknown template).
     #[error("not a swag project: {0}")]

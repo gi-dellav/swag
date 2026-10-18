@@ -58,6 +58,25 @@ fn swag_with_stdin(home: &std::path::Path, args: &[&str], stdin: &str) -> (Strin
     )
 }
 
+/// Like [`swag`] but runs the binary with `cwd` as working directory.
+fn swag_in_dir(
+    home: &std::path::Path,
+    cwd: &std::path::Path,
+    args: &[&str],
+) -> (String, String, i32) {
+    let output = Command::new(env!("CARGO_BIN_EXE_swag"))
+        .env("SWAG_HOME", home)
+        .current_dir(cwd)
+        .args(args)
+        .output()
+        .expect("could not spawn swag binary");
+    (
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+        output.status.code().unwrap_or(-1),
+    )
+}
+
 struct Home {
     dir: PathBuf,
 }
@@ -529,4 +548,160 @@ fn help_documents_template_default() {
         out.contains("template id: [default: svelte-clean-template]"),
         "{out}"
     );
+}
+
+#[test]
+fn relative_template_path_is_canonicalized() {
+    let home = Home::fresh("rel-template");
+    let src = home.dir.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("package.json"),
+        r#"{"name": "svelte-clean-template"}"#,
+    )
+    .unwrap();
+
+    let (out, err, code) = swag_in_dir(
+        &home.dir,
+        &home.dir,
+        &[
+            "templates",
+            "add",
+            "local-rel",
+            "--base",
+            "clean",
+            "--path",
+            "src",
+        ],
+    );
+    assert_eq!(code, 0, "{out} {err}");
+
+    let (out, _, code) = home.run(&["templates", "show", "local-rel", "--json"]);
+    assert_eq!(code, 0, "{out}");
+    let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+    let stored = parsed["source"]["path"].as_str().expect("source path");
+    assert!(
+        std::path::Path::new(stored).is_absolute(),
+        "stored path must be absolute: {stored}"
+    );
+    assert_eq!(
+        std::path::Path::new(stored).canonicalize().unwrap(),
+        src.canonicalize().unwrap()
+    );
+
+    // Scaffold from a different working directory: the stored absolute path
+    // must still resolve.
+    let other = unique_home("rel-template-cwd");
+    std::fs::create_dir_all(&other).unwrap();
+    let dest = home.dir.join("out").join("demo");
+    let (out, err, code) = swag_in_dir(
+        &home.dir,
+        &other,
+        &[
+            "new",
+            "--template",
+            "local-rel",
+            "demo",
+            "--output",
+            dest.to_str().expect("utf8"),
+            "--no-install",
+            "--no-git-init",
+        ],
+    );
+    assert_eq!(code, 0, "{out} {err}");
+    assert!(
+        std::fs::read_to_string(dest.join("package.json"))
+            .expect("scaffolded package.json")
+            .contains("demo")
+    );
+    let _ = std::fs::remove_dir_all(&other);
+}
+
+#[test]
+fn force_refuses_to_remove_cwd_or_ancestor() {
+    let home = Home::fresh("force-guard");
+    let base = home.dir.join("base");
+    let child = base.join("child");
+    std::fs::create_dir_all(&child).unwrap();
+    std::fs::write(child.join("keep.txt"), "keep").unwrap();
+
+    let (_, err, code) = swag_in_dir(
+        &home.dir,
+        &child,
+        &[
+            "new",
+            "--force",
+            "--template",
+            "clean",
+            "demo",
+            "--output",
+            base.to_str().expect("utf8"),
+        ],
+    );
+    assert_ne!(code, 0);
+    assert!(err.contains("unsafe destination"), "{err}");
+    assert!(child.join("keep.txt").is_file(), "files must be untouched");
+
+    let (_, err, code) = swag_in_dir(
+        &home.dir,
+        &child,
+        &[
+            "new",
+            "--force",
+            "--template",
+            "clean",
+            "demo",
+            "--output",
+            ".",
+        ],
+    );
+    assert_ne!(code, 0);
+    assert!(err.contains("unsafe destination"), "{err}");
+    assert!(child.join("keep.txt").is_file(), "files must be untouched");
+}
+
+#[test]
+fn projects_add_validates_owner_and_template() {
+    let home = Home::fresh("add-validation");
+    let target = std::env::temp_dir();
+    let target = target.to_str().expect("utf8 temp dir");
+
+    let (_, err, code) = home.run(&[
+        "projects",
+        "add",
+        "demo",
+        "--path",
+        target,
+        "--owner",
+        "bad owner",
+    ]);
+    assert_ne!(code, 0);
+    assert!(err.contains("invalid GitHub owner"), "{err}");
+
+    let (_, err, code) = home.run(&[
+        "projects",
+        "add",
+        "demo",
+        "--path",
+        target,
+        "--template",
+        "no-such-template",
+    ]);
+    assert_ne!(code, 0);
+    assert!(err.contains("unknown template"), "{err}");
+
+    let (out, _, code) = home.run(&[
+        "projects",
+        "add",
+        "demo",
+        "--path",
+        target,
+        "--template",
+        "clean",
+    ]);
+    assert_eq!(code, 0, "{out}");
+    let (out, _, code) = home.run(&["projects", "show", "demo", "--json"]);
+    assert_eq!(code, 0, "{out}");
+    let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+    assert_eq!(parsed["template"], "svelte-clean-template");
 }
