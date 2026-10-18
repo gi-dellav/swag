@@ -4,7 +4,7 @@
 //! `git clone --depth 1 https://github.com/gi-dellav/<template>.git`,
 //! then personalized (template id → project name, template owner → `--owner`),
 //! detached from the template's git history, and optionally provisioned with
-//! `bun install`.
+//! `swag install` (Bun + Cargo, depending on the template).
 //!
 //! Template-name occurrences were inventoried from the live templates:
 //! - `svelte-clean-template`: `package.json` + `bun.lock` (name),
@@ -18,8 +18,9 @@
 //!   `src-tauri/Cargo.lock` (name), `src-tauri/tauri.conf.json`
 //!   (productName, identifier), `src/routes/Home.svelte` (eyebrow),
 //!   `README.md`.
-//! - `svelte-fullstack-template`: currently a stub (README only); the
-//!   generic text-file walk below covers whatever it grows into.
+//! - `svelte-fullstack-template`: `frontend/package.json` +
+//!   `frontend/bun.lock` and `backend/Cargo.toml` + `backend/Cargo.lock`
+//!   (names); the generic text-file walk below covers the rest.
 //!
 //! Owner occurrences (`gi-dellav` in repo slugs, URLs and Pages domains;
 //! `gidellav` in the Tauri bundle identifier `com.gidellav.*`, where hyphens
@@ -38,7 +39,6 @@ use std::process::Command;
 
 use serde::Serialize;
 
-use crate::bun::Bun;
 use crate::custom_templates::{self, ResolvedTemplate, TemplateSource};
 use crate::error::{Error, Result};
 use crate::template::Template;
@@ -75,7 +75,7 @@ pub struct ScaffoldOptions {
     /// scaffolded README links, `Cargo.toml` repository and `identifier`
     /// point at you from the start.
     pub owner: Option<String>,
-    /// Skip the `bun install` provisioning step.
+    /// Skip the template-aware dependency provisioning step.
     pub no_install: bool,
     /// Skip the fresh `git init` after detaching template history.
     pub no_git_init: bool,
@@ -114,34 +114,57 @@ pub struct Project {
 }
 
 impl Project {
-    /// `bun install --ignore-scripts` in the project root.
+    /// Run a template-aware action against this project.
+    ///
+    /// `web` / `rust` are the CLI selection flags; passing neither drives
+    /// every component the template provides (web + Rust for fullstack and
+    /// desktop, web only for the static template). `extra` is forwarded only
+    /// when the action resolves to a single command.
+    pub fn action(
+        &self,
+        action: crate::tasks::Action,
+        web: bool,
+        rust: bool,
+        extra: &[String],
+    ) -> Result<()> {
+        let layout = crate::layout::ProjectLayout::detect(&self.path)?;
+        let plan = crate::tasks::plan(&layout, action, web, rust, extra)?;
+        crate::tasks::execute(&plan)
+    }
+
+    /// Install Bun and Cargo dependencies for every component.
     pub fn install(&self) -> Result<()> {
-        Bun::new()?.install(&self.path)
+        self.action(crate::tasks::Action::Install, false, false, &[])
     }
 
-    /// `bun run dev [-- extra...]` in the project root.
+    /// Start the template's development servers.
     pub fn dev(&self, extra: &[String]) -> Result<()> {
-        Bun::new()?.dev(&self.path, extra)
+        self.action(crate::tasks::Action::Dev, false, false, extra)
     }
 
-    /// `bun run build [-- extra...]` in the project root.
+    /// Build every component for production.
     pub fn build(&self, extra: &[String]) -> Result<()> {
-        Bun::new()?.build(&self.path, extra)
+        self.action(crate::tasks::Action::Build, false, false, extra)
     }
 
-    /// `bun run check [-- extra...]` (svelte-check) in the project root.
+    /// Run type checks, formatting and lints for every component.
     pub fn check(&self, extra: &[String]) -> Result<()> {
-        Bun::new()?.check(&self.path, extra)
+        self.action(crate::tasks::Action::Check, false, false, extra)
     }
 
-    /// `bun run test [-- extra...]` (`bun test`) in the project root.
+    /// Run unit tests for every component.
     pub fn test(&self, extra: &[String]) -> Result<()> {
-        Bun::new()?.test(&self.path, extra)
+        self.action(crate::tasks::Action::Test, false, false, extra)
     }
 
-    /// `bun run preview [-- extra...]` in the project root.
+    /// Preview the web production build.
     pub fn preview(&self, extra: &[String]) -> Result<()> {
-        Bun::new()?.preview(&self.path, extra)
+        self.action(crate::tasks::Action::Preview, false, false, extra)
+    }
+
+    /// Run the production runtime (requires a prior build).
+    pub fn run(&self, extra: &[String]) -> Result<()> {
+        self.action(crate::tasks::Action::Run, false, false, extra)
     }
 }
 
@@ -190,7 +213,7 @@ pub fn list_templates() -> Vec<TemplateInfo> {
     out
 }
 
-/// Clone, personalize, detach history and optionally `bun install`.
+/// Clone, personalize, detach history and optionally install dependencies.
 ///
 /// Steps:
 /// 1. validate the project name (and `--owner` when given);
@@ -203,7 +226,7 @@ pub fn list_templates() -> Vec<TemplateInfo> {
 ///    default, `gi-dellav` → owner everywhere, `gidellav` → owner with
 ///    hyphens stripped in the Tauri identifier);
 /// 5. delete the cloned `.git/` and (unless `no_git_init`) `git init`;
-/// 6. run `bun install --ignore-scripts` (unless `no_install`);
+/// 6. run the template-aware install (Bun and/or Cargo, unless `no_install`);
 /// 7. auto-register the project in `~/.swag/projects.json`.
 ///
 /// In `init` mode (`options.init`) the destination must already exist:
@@ -246,7 +269,7 @@ pub fn scaffold(options: &ScaffoldOptions) -> Result<Project> {
         path: dest.clone(),
     };
     if !options.no_install {
-        Bun::new()?.install(&dest)?;
+        project.install()?;
     }
     // Auto-register (best effort resolved through the registry layer; a
     // registry failure after a successful scaffold must fail loudly so the

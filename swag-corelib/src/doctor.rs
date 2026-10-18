@@ -245,60 +245,77 @@ fn version_check(dir: &Path, out: &mut Vec<Check>) {
 
 fn type_check(dir: &Path, out: &mut Vec<Check>) {
     let raw = std::fs::read_to_string(dir.join(crate::template::TEMPLATE_TYPE_FILE));
-    match raw {
-        Err(_) => out.push(Check::warn(
-            "project-type",
-            "no .template_type (legacy template)",
-            "template should ship frontend|backend|desktop in .template_type",
-        )),
+    let kind = match raw {
+        Err(_) => {
+            out.push(Check::warn(
+                "project-type",
+                "no .template_type (legacy template)",
+                "template should ship frontend|backend|desktop in .template_type",
+            ));
+            None
+        }
         Ok(content) => match crate::template::TemplateType::parse(&content) {
             Some(kind) => {
                 out.push(Check::ok("project-type", kind.as_str().to_string()));
-                if kind.needs_rust()
-                    && !dir.join("Cargo.toml").exists()
-                    && !dir.join("src-tauri").exists()
-                    && !dir.join("backend").exists()
-                {
-                    out.push(Check::warn(
-                        "project-rust",
-                        format!("type {kind} but no Rust layout found"),
-                        "expect Cargo.toml, src-tauri/ or backend/ for backend/desktop projects",
-                    ));
-                }
-                if kind == crate::template::TemplateType::Desktop
-                    && !dir.join("src-tauri").join("tauri.conf.json").exists()
-                {
-                    let message = if dir.join("src-tauri").is_dir() {
-                        "desktop project without src-tauri/tauri.conf.json"
-                    } else {
-                        "desktop project without src-tauri/"
-                    };
-                    out.push(Check::warn(
-                        "project-tauri",
-                        message,
-                        "check the template ships src-tauri/tauri.conf.json",
-                    ));
-                }
+                Some(kind)
             }
-            None => out.push(Check::fail(
-                "project-type",
-                format!("unknown type: {:?}", content.trim()),
-                "template must write frontend, backend or desktop into .template_type",
-            )),
+            None => {
+                out.push(Check::fail(
+                    "project-type",
+                    format!("unknown type: {:?}", content.trim()),
+                    "template must write frontend, backend or desktop into .template_type",
+                ));
+                None
+            }
         },
-    }
-    if !dir.join("package.json").exists() {
-        out.push(Check::fail(
+    };
+
+    match crate::layout::ProjectLayout::detect(dir) {
+        Ok(layout) => {
+            if kind.is_some_and(crate::template::TemplateType::needs_rust)
+                && layout.rust_root.is_none()
+            {
+                out.push(Check::warn(
+                    "project-rust",
+                    format!("type {} but no Rust layout found", layout.kind),
+                    "expect Cargo.toml, src-tauri/ or backend/ for backend/desktop projects",
+                ));
+            }
+            if let Some(web_root) = layout.web_root.as_deref() {
+                if !web_root.join("node_modules").exists() {
+                    out.push(Check::warn(
+                        "project-deps",
+                        format!("no node_modules/ in '{}'", web_root.display()),
+                        "run `swag install` in the project directory",
+                    ));
+                }
+            } else {
+                out.push(Check::fail(
+                    "project-package",
+                    "no package.json",
+                    "not a bun-managed project (run `swag new` or restore the file)",
+                ));
+            }
+        }
+        Err(e) => out.push(Check::fail(
             "project-package",
-            "no package.json",
-            "not a bun-managed project (run `swag new` or restore the file)",
-        ));
+            format!("could not determine project layout: {e}"),
+            "run `swag doctor` after restoring .template_type or package.json",
+        )),
     }
-    if !dir.join("node_modules").exists() {
+
+    if kind == Some(crate::template::TemplateType::Desktop)
+        && !dir.join("src-tauri").join("tauri.conf.json").exists()
+    {
+        let message = if dir.join("src-tauri").is_dir() {
+            "desktop project without src-tauri/tauri.conf.json"
+        } else {
+            "desktop project without src-tauri/"
+        };
         out.push(Check::warn(
-            "project-deps",
-            "no node_modules/",
-            "run `bun install` in the project directory",
+            "project-tauri",
+            message,
+            "check the template ships src-tauri/tauri.conf.json",
         ));
     }
 }
@@ -422,6 +439,43 @@ mod tests {
         for name in ["bun", "git", "cargo", "home"] {
             assert!(report.checks.iter().any(|c| c.name == name), "{name}");
         }
+    }
+
+    #[test]
+    fn fullstack_layout_checks_frontend_root() {
+        let dir = stamp("fullstack-layout");
+        std::fs::create_dir_all(dir.join("frontend")).unwrap();
+        std::fs::create_dir_all(dir.join("backend")).unwrap();
+        std::fs::write(dir.join(".template_type"), "backend\n").unwrap();
+        std::fs::write(dir.join("frontend/package.json"), "{}").unwrap();
+        std::fs::write(
+            dir.join("backend/Cargo.toml"),
+            "[package]\nname = \"backend\"\n",
+        )
+        .unwrap();
+        let report = doctor(Some(&dir));
+        assert!(
+            !report
+                .checks
+                .iter()
+                .any(|c| c.name == "project-package" && c.status == Status::Fail),
+            "{report:?}"
+        );
+        let deps = report
+            .checks
+            .iter()
+            .find(|c| c.name == "project-deps")
+            .expect("project-deps check");
+        assert_eq!(deps.status, Status::Warn, "{deps:?}");
+        assert!(deps.message.contains("frontend"), "{deps:?}");
+        assert!(
+            !report
+                .checks
+                .iter()
+                .any(|c| c.name == "project-rust" && c.status == Status::Warn),
+            "{report:?}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

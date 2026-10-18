@@ -10,7 +10,7 @@ use clap::{Parser, Subcommand};
 use colorized::{Color, Colors};
 use dialoguer::{Input, Select};
 
-use swag_corelib::{Error, Project, ScaffoldOptions, Template, project};
+use swag_corelib::{Action, Error, Project, ScaffoldOptions, Template, project};
 
 /// Static webapp generator: scaffold bun-managed Svelte projects from templates.
 #[derive(Debug, Parser)]
@@ -165,18 +165,34 @@ enum Command {
         print: bool,
     },
 
-    /// Install dependencies in a project directory.
+    /// Install Bun and Cargo dependencies in a project directory.
     Install {
         /// Project directory (defaults to the current directory).
         #[arg(default_value = ".")]
         dir: PathBuf,
+
+        /// Only the Bun/Vite (web) component.
+        #[arg(long)]
+        web: bool,
+
+        /// Only the Cargo/Tauri (Rust) component.
+        #[arg(long)]
+        rust: bool,
     },
 
-    /// Run the dev server in a project directory.
+    /// Run the development servers in a project directory.
     Dev {
         /// Project directory (defaults to the current directory).
         #[arg(default_value = ".")]
         dir: PathBuf,
+
+        /// Only the Bun/Vite (web) component.
+        #[arg(long)]
+        web: bool,
+
+        /// Only the Cargo/Tauri (Rust) component.
+        #[arg(long)]
+        rust: bool,
 
         /// Extra arguments forwarded after `--` to the script.
         #[arg(last = true)]
@@ -189,16 +205,32 @@ enum Command {
         #[arg(default_value = ".")]
         dir: PathBuf,
 
+        /// Only the Bun/Vite (web) component.
+        #[arg(long)]
+        web: bool,
+
+        /// Only the Cargo/Tauri (Rust) component.
+        #[arg(long)]
+        rust: bool,
+
         /// Extra arguments forwarded after `--` to the script.
         #[arg(last = true)]
         extra: Vec<String>,
     },
 
-    /// Type-check in a project directory.
+    /// Type-check, format-check and lint a project directory.
     Check {
         /// Project directory (defaults to the current directory).
         #[arg(default_value = ".")]
         dir: PathBuf,
+
+        /// Only the Bun/Vite (web) component.
+        #[arg(long)]
+        web: bool,
+
+        /// Only the Cargo/Tauri (Rust) component.
+        #[arg(long)]
+        rust: bool,
 
         /// Extra arguments forwarded after `--` to the script.
         #[arg(last = true)]
@@ -211,16 +243,51 @@ enum Command {
         #[arg(default_value = ".")]
         dir: PathBuf,
 
+        /// Only the Bun/Vite (web) component.
+        #[arg(long)]
+        web: bool,
+
+        /// Only the Cargo/Tauri (Rust) component.
+        #[arg(long)]
+        rust: bool,
+
         /// Extra arguments forwarded after `--` to the script.
         #[arg(last = true)]
         extra: Vec<String>,
     },
 
-    /// Preview the production build in a project directory.
+    /// Preview the web production build in a project directory.
     Preview {
         /// Project directory (defaults to the current directory).
         #[arg(default_value = ".")]
         dir: PathBuf,
+
+        /// Only the Bun/Vite (web) component (the default).
+        #[arg(long)]
+        web: bool,
+
+        /// Not supported by `preview`; use `run --rust`.
+        #[arg(long)]
+        rust: bool,
+
+        /// Extra arguments forwarded after `--` to the script.
+        #[arg(last = true)]
+        extra: Vec<String>,
+    },
+
+    /// Run the production app (requires a prior `swag build`).
+    Run {
+        /// Project directory (defaults to the current directory).
+        #[arg(default_value = ".")]
+        dir: PathBuf,
+
+        /// Only the Bun/Vite (web) component (production preview).
+        #[arg(long)]
+        web: bool,
+
+        /// Only the Cargo/Tauri (Rust) component (the desktop default).
+        #[arg(long)]
+        rust: bool,
 
         /// Extra arguments forwarded after `--` to the script.
         #[arg(last = true)]
@@ -677,33 +744,66 @@ fn run() -> Result<(), Error> {
                 enter_subshell(&entry.path)?;
             }
         }
-        Command::Install { dir } => {
+        Command::Install { dir, web, rust } => {
             print_banner(false);
-            let bun = swag_corelib::Bun::new()?;
-            bun.install(&dir)?;
-            println!("`bun install` OK in {}", dir.display());
+            project_at(&dir).action(Action::Install, web, rust, &[])?;
+            println!("dependencies installed in {}", dir.display());
         }
-        Command::Dev { dir, extra } => {
+        Command::Dev {
+            dir,
+            web,
+            rust,
+            extra,
+        } => {
             print_banner(false);
-            project_at(&dir).dev(&extra)?;
+            project_at(&dir).action(Action::Dev, web, rust, &extra)?;
         }
-        Command::Build { dir, extra } => {
+        Command::Build {
+            dir,
+            web,
+            rust,
+            extra,
+        } => {
             print_banner(false);
-            project_at(&dir).build(&extra)?;
-            println!("`bun run build` OK in {}", dir.display());
+            project_at(&dir).action(Action::Build, web, rust, &extra)?;
+            println!("build OK in {}", dir.display());
         }
-        Command::Check { dir, extra } => {
-            project_at(&dir).check(&extra)?;
-            println!("`bun run check` OK in {}", dir.display());
+        Command::Check {
+            dir,
+            web,
+            rust,
+            extra,
+        } => {
+            project_at(&dir).action(Action::Check, web, rust, &extra)?;
+            println!("check OK in {}", dir.display());
         }
-        Command::Test { dir, extra } => {
+        Command::Test {
+            dir,
+            web,
+            rust,
+            extra,
+        } => {
             print_banner(false);
-            project_at(&dir).test(&extra)?;
-            println!("`bun run test` OK in {}", dir.display());
+            project_at(&dir).action(Action::Test, web, rust, &extra)?;
+            println!("test OK in {}", dir.display());
         }
-        Command::Preview { dir, extra } => {
+        Command::Preview {
+            dir,
+            web,
+            rust,
+            extra,
+        } => {
             print_banner(false);
-            project_at(&dir).preview(&extra)?;
+            project_at(&dir).action(Action::Preview, web, rust, &extra)?;
+        }
+        Command::Run {
+            dir,
+            web,
+            rust,
+            extra,
+        } => {
+            print_banner(false);
+            project_at(&dir).action(Action::Run, web, rust, &extra)?;
         }
         Command::Update {
             target,
@@ -830,7 +930,7 @@ fn banner_colorized(force: bool) -> bool {
 }
 
 /// Print `⬢ SWAG {version}` in light blue to stderr, at the start of the
-/// `new`/`init`/`dev`/`build`/`install`/`preview`/`vc`/`test` commands.
+/// `new`/`init`/`dev`/`build`/`install`/`preview`/`run`/`vc`/`test` commands.
 fn print_banner(force_color: bool) {
     let banner = format!("⬢ SWAG {}", env!("CARGO_PKG_VERSION"));
     if banner_colorized(force_color) {
@@ -921,14 +1021,14 @@ fn run_scaffold(
         println!("registered '{}' in ~/.swag/projects.json", project.name);
     }
     if no_install {
-        println!("skipped `bun install` — run `bun install` in the project dir");
+        println!("skipped dependency install — run `swag install` in the project dir");
     } else if colorized {
         println!(
             "{}",
-            "installed dependencies with `bun install`".color(Colors::BrightGreenFg)
+            "installed dependencies with `swag install`".color(Colors::BrightGreenFg)
         );
     } else {
-        println!("installed dependencies with `bun install`");
+        println!("installed dependencies with `swag install`");
     }
     Ok(())
 }

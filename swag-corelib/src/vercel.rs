@@ -15,7 +15,6 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-use crate::custom_templates::ResolvedTemplate;
 use crate::error::{Error, Result};
 use crate::template::TemplateType;
 
@@ -201,7 +200,7 @@ impl Vercel {
 /// and custom-base projects work), and refuses desktop (Tauri) projects:
 /// Vercel cannot run a desktop app.
 pub fn detect_kind(dir: &Path) -> Result<DeployKind> {
-    match template_type_for_dir(dir)? {
+    match crate::provenance::template_type_for_dir(dir)? {
         TemplateType::Frontend => Ok(DeployKind::Frontend),
         TemplateType::Backend => Ok(DeployKind::Backend),
         TemplateType::Desktop => Err(Error::CommandFailed(format!(
@@ -269,29 +268,6 @@ pub fn preflight(dir: &Path, kind: &DeployKind) -> Result<Vec<String>> {
         }
     }
     Ok(notes)
-}
-
-/// Resolve the [`TemplateType`] of `dir`: provenance first (resolved template
-/// wins so custom templates inherit their base), then `.template_type`.
-fn template_type_for_dir(dir: &Path) -> Result<TemplateType> {
-    if let Ok(prov) = crate::provenance::load(dir) {
-        let resolved_type = crate::custom_templates::resolve_id(&prov.template)
-            .ok()
-            .map(|resolved| match resolved {
-                ResolvedTemplate::Builtin(t) => t.template_type(),
-                ResolvedTemplate::Custom(c) => c.base.template_type(),
-            });
-        if let Some(kind) = resolved_type.or(prov.template_type) {
-            return Ok(kind);
-        }
-    }
-    if let Some(kind) = crate::template::read_template_type(dir) {
-        return Ok(kind);
-    }
-    Err(Error::NotAProject(format!(
-        "cannot determine project type for '{}' (no .swag.json or .template_type)",
-        dir.display()
-    )))
 }
 
 /// Build the `vercel link` argument list (validated).

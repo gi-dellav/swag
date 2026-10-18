@@ -16,6 +16,10 @@ pub enum Error {
     #[error("bun not found on PATH (requires bun >= 1.1): {0}")]
     BunNotFound(String),
 
+    /// The `cargo` binary could not be found on PATH.
+    #[error("cargo not found on PATH (install Rust via rustup, https://rustup.rs): {0}")]
+    CargoNotFound(String),
+
     /// The `vercel` binary could not be found on PATH.
     #[error(
         "vercel not found on PATH (install with `npm i -g vercel` or `bun add -g vercel`, see https://vercel.com/docs/cli): {0}"

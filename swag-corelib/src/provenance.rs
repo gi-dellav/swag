@@ -107,6 +107,61 @@ pub fn save(dir: &Path, provenance: &Provenance) -> Result<()> {
     })
 }
 
+/// Resolve the [`TemplateType`] of a project directory.
+///
+/// Resolution order:
+/// 1. `.swag.json` provenance, with custom templates inheriting their base
+///    builtin's type;
+/// 2. the provenance's recorded `template_type` (when the template id is no
+///    longer resolvable);
+/// 3. the `.template_type` file shipped by the template;
+/// 4. layout markers, for hand-created or legacy projects.
+pub fn template_type_for_dir(dir: &Path) -> Result<TemplateType> {
+    if let Ok(provenance) = load(dir) {
+        if let Ok(resolved) = crate::custom_templates::resolve_id(&provenance.template) {
+            return Ok(match resolved {
+                crate::custom_templates::ResolvedTemplate::Builtin(template) => {
+                    template.template_type()
+                }
+                crate::custom_templates::ResolvedTemplate::Custom(custom) => {
+                    custom.base.template_type()
+                }
+            });
+        }
+        if let Some(kind) = provenance.template_type {
+            return Ok(kind);
+        }
+    }
+    if let Some(kind) = crate::template::read_template_type(dir) {
+        return Ok(kind);
+    }
+    if let Some(kind) = infer_template_type(dir) {
+        return Ok(kind);
+    }
+    Err(Error::NotAProject(format!(
+        "cannot determine project type for '{}' (no .swag.json or .template_type)",
+        dir.display()
+    )))
+}
+
+/// Best-effort type inference from the directory layout, used only when a
+/// project ships neither provenance nor a `.template_type` file.
+fn infer_template_type(dir: &Path) -> Option<TemplateType> {
+    let package = dir.join("package.json").is_file();
+    let tauri = dir.join("src-tauri").join("Cargo.toml").is_file();
+    let fullstack = dir.join("frontend").join("package.json").is_file()
+        && dir.join("backend").join("Cargo.toml").is_file();
+    if tauri && package {
+        Some(TemplateType::Desktop)
+    } else if fullstack {
+        Some(TemplateType::Backend)
+    } else if package {
+        Some(TemplateType::Frontend)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -27,11 +27,23 @@ You can download the *SWAG* CLI from:
 
 ### Projects
 
-A Project can be created with `swag new`, you can run a development server with `swag dev`, you can build a production version with `swag build`, and you can deploy to Vercel with `swag vc`.
+A Project can be created with `swag new`; use `swag init` to scaffold into an existing directory instead of creating a new one. Both prompt for a missing name/template, and you can manage user-level Projects with `swag projects`.
 
-`swag new` prompts for a missing project name and template; use `swag init` to scaffold into an existing directory instead of creating a new one (name and template are prompted there too).
+Commands are template-aware: fullstack and desktop projects mix Bun and Cargo, so `swag` drives every component a template provides.
 
-You can manage user-level Projects with `swag projects`.
+| command | frontend | fullstack | desktop |
+|---|---|---|---|
+| `swag install` | `bun install` | Bun (`frontend/`) + `cargo fetch` (`backend/`) | Bun (`/`) + `cargo fetch` (`src-tauri/`) |
+| `swag dev` | `bun run dev` | frontend dev server + backend `cargo run` | `bun run desktop:dev` (Tauri + Vite) |
+| `swag build` | `bun run build` | frontend build + `cargo build --release` | `bun run desktop:build` (Tauri bundle) |
+| `swag check` | `bun run check` | Svelte check + Rust fmt/clippy | same web check + Rust fmt/clippy |
+| `swag test` | `bun run test` | Bun tests + `cargo test` | Bun tests + `cargo test` |
+| `swag run` | `bun run preview` | production preview + `cargo run --release` | `cargo run --release` (Tauri app) |
+| `swag preview` | `bun run preview` | frontend production preview | frontend production preview |
+
+Use `--web` or `--rust` to restrict a command to one component. Combined fullstack commands run concurrently for `dev`/`run` and sequentially for setup, checks, tests and builds. `swag run` is the production runtime: run `swag build` first. Extra arguments after `--` are forwarded when the command resolves to a single process; pass `--web`/`--rust` to disambiguate.
+
+Deploy to Vercel with `swag vc`.
 
 ### Templates
 
