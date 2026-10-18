@@ -46,3 +46,60 @@ jobs:
           ./target/release/swag build e2e-app
           test -n "$(find e2e-app/dist -type f -print -quit)"
           ./target/release/swag test e2e-app
+
+  e2e-fullstack:
+    name: e2e (fullstack)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: oven-sh/setup-bun@v2
+      - name: Build swag
+        run: cargo build --release -p swag-cli
+      - name: Scaffold, build and test
+        env:
+          SWAG_HOME: ${{ runner.temp }}/swag-home
+        run: |
+          set -euo pipefail
+          ./target/release/swag new e2e-app --template fullstack --no-git-init
+          ./target/release/swag build e2e-app
+          test -n "$(find e2e-app/frontend/dist -type f -print -quit)"
+          ./target/release/swag test e2e-app
+
+  e2e-tauri:
+    name: e2e (tauri)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Tauri Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libxdo-dev \
+            libssl-dev \
+            patchelf
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: oven-sh/setup-bun@v2
+      - name: Build swag
+        run: cargo build --release -p swag-cli
+      - name: Scaffold, build and test
+        env:
+          SWAG_HOME: ${{ runner.temp }}/swag-home
+        run: |
+          set -euo pipefail
+          ./target/release/swag new e2e-app --template tauri --no-git-init
+          ./target/release/swag build e2e-app
+          test -n "$(find e2e-app/dist -type f -print -quit)"
+          test -n "$(find e2e-app/src-tauri/target/release/bundle -type f -print -quit)"
+          ./target/release/swag test e2e-app
