@@ -30,8 +30,6 @@ jobs:
   e2e:
     name: e2e
     runs-on: ubuntu-latest
-    env:
-      SWAG_HOME: ${{ runner.temp }}/swag-home
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -40,6 +38,8 @@ jobs:
       - name: Build swag
         run: cargo build --release -p swag-cli
       - name: Scaffold, build and test
+        env:
+          SWAG_HOME: ${{ runner.temp }}/swag-home
         run: |
           set -euo pipefail
           ./target/release/swag new e2e-app --template clean --no-git-init
