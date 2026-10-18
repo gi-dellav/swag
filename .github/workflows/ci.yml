@@ -42,10 +42,11 @@ jobs:
           SWAG_HOME: ${{ runner.temp }}/swag-home
         run: |
           set -euo pipefail
-          ./target/release/swag new e2e-app --template clean --no-git-init
-          ./target/release/swag build e2e-app
-          test -n "$(find e2e-app/dist -type f -print -quit)"
-          ./target/release/swag test e2e-app
+          APP="$RUNNER_TEMP/e2e-app"
+          ./target/release/swag new e2e-app --template clean --output "$APP" --no-git-init
+          ./target/release/swag build "$APP"
+          test -n "$(find "$APP/dist" -type f -print -quit)"
+          ./target/release/swag test "$APP"
 
   e2e-fullstack:
     name: e2e (fullstack)
@@ -63,10 +64,11 @@ jobs:
           SWAG_HOME: ${{ runner.temp }}/swag-home
         run: |
           set -euo pipefail
-          ./target/release/swag new e2e-app --template fullstack --no-git-init
-          ./target/release/swag build e2e-app
-          test -n "$(find e2e-app/frontend/dist -type f -print -quit)"
-          ./target/release/swag test e2e-app
+          APP="$RUNNER_TEMP/e2e-app"
+          ./target/release/swag new e2e-app --template fullstack --output "$APP" --no-git-init
+          ./target/release/swag build "$APP"
+          test -n "$(find "$APP/frontend/dist" -type f -print -quit)"
+          ./target/release/swag test "$APP"
 
   e2e-tauri:
     name: e2e (tauri)
@@ -98,8 +100,9 @@ jobs:
           SWAG_HOME: ${{ runner.temp }}/swag-home
         run: |
           set -euo pipefail
-          ./target/release/swag new e2e-app --template tauri --no-git-init
-          ./target/release/swag build e2e-app
-          test -n "$(find e2e-app/dist -type f -print -quit)"
-          test -n "$(find e2e-app/src-tauri/target/release/bundle -type f -print -quit)"
-          ./target/release/swag test e2e-app
+          APP="$RUNNER_TEMP/e2e-app"
+          ./target/release/swag new e2e-app --template tauri --output "$APP" --no-git-init
+          ./target/release/swag build "$APP"
+          test -n "$(find "$APP/dist" -type f -print -quit)"
+          test -n "$(find "$APP/src-tauri/target/release/bundle" -type f -print -quit)"
+          ./target/release/swag test "$APP"
