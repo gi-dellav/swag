@@ -451,7 +451,6 @@ fn init_scaffolds_into_preexisting_dir() {
     let (out, err, code) = home.run_with_stdin(
         &[
             "init",
-            "--output",
             dest.to_str().expect("utf8"),
             "--no-install",
             "--no-git-init",
@@ -469,6 +468,74 @@ fn init_scaffolds_into_preexisting_dir() {
     );
 }
 
+/// A fresh GitHub repo (only `.git`, `.gitignore`, `README.md`, `LICENSE`)
+/// is initialized without `--force`; the repo metadata is not wiped.
+#[test]
+fn init_accepts_github_repo_files_without_force() {
+    let home = Home::fresh("init-github");
+    let src = home.write_template("tpl-github");
+    std::fs::write(src.join(".gitignore"), "template-ignore\n").unwrap();
+    std::fs::write(src.join("README.md"), "template readme\n").unwrap();
+    std::fs::write(src.join("LICENSE"), "template license\n").unwrap();
+    home.register_template("local-github", &src);
+
+    let dest = home.dir.join("repo");
+    std::fs::create_dir_all(dest.join(".git")).unwrap();
+    std::fs::write(dest.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    std::fs::write(dest.join(".gitignore"), "placeholder\n").unwrap();
+    std::fs::write(dest.join("README.md"), "my readme\n").unwrap();
+    std::fs::write(dest.join("LICENSE"), "my license\n").unwrap();
+
+    let (out, err, code) = home.run_with_stdin(
+        &[
+            "init",
+            dest.to_str().expect("utf8"),
+            "--template",
+            "local-github",
+            "--no-install",
+            "--no-git-init",
+        ],
+        "\n",
+    );
+    assert_eq!(code, 0, "{out} {err}");
+    assert!(
+        std::fs::read_to_string(dest.join(".git").join("HEAD"))
+            .expect(".git must be preserved")
+            .contains("refs/heads/main")
+    );
+    assert_eq!(
+        std::fs::read_to_string(dest.join("README.md")).unwrap(),
+        "my readme\n",
+        "an existing README must be preserved"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dest.join("LICENSE")).unwrap(),
+        "my license\n",
+        "an existing LICENSE must be preserved"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dest.join(".gitignore")).unwrap(),
+        "template-ignore\n",
+        "the template .gitignore must replace the placeholder"
+    );
+    assert!(dest.join("package.json").is_file());
+}
+
+/// `swag init` requires an explicit directory instead of defaulting to cwd.
+#[test]
+fn init_requires_directory_argument() {
+    let home = Home::fresh("init-no-dir");
+    let (_, err, code) = home.run(&[
+        "init",
+        "--template",
+        "clean",
+        "--no-install",
+        "--no-git-init",
+    ]);
+    assert_ne!(code, 0);
+    assert!(err.contains("<DIR>"), "{err}");
+}
+
 /// `swag init` refuses missing and non-empty destinations; `--force` empties
 /// a non-empty destination but keeps the directory itself.
 #[test]
@@ -481,10 +548,9 @@ fn init_destination_guards_and_force() {
     let (_, err, code) = home.run_with_stdin(
         &[
             "init",
+            missing.to_str().expect("utf8"),
             "--template",
             "local-guards",
-            "--output",
-            missing.to_str().expect("utf8"),
             "--no-install",
             "--no-git-init",
         ],
@@ -499,10 +565,9 @@ fn init_destination_guards_and_force() {
     let (_, err, code) = home.run_with_stdin(
         &[
             "init",
+            dirty.to_str().expect("utf8"),
             "--template",
             "local-guards",
-            "--output",
-            dirty.to_str().expect("utf8"),
             "--no-install",
             "--no-git-init",
         ],
@@ -514,10 +579,9 @@ fn init_destination_guards_and_force() {
     let (out, err, code) = home.run_with_stdin(
         &[
             "init",
+            dirty.to_str().expect("utf8"),
             "--template",
             "local-guards",
-            "--output",
-            dirty.to_str().expect("utf8"),
             "--force",
             "--no-install",
             "--no-git-init",

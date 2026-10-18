@@ -26,3 +26,23 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --all
+
+  e2e:
+    name: e2e
+    runs-on: ubuntu-latest
+    env:
+      SWAG_HOME: ${{ runner.temp }}/swag-home
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: oven-sh/setup-bun@v2
+      - name: Build swag
+        run: cargo build --release -p swag-cli
+      - name: Scaffold, build and test
+        run: |
+          set -euo pipefail
+          ./target/release/swag new e2e-app --template clean --no-git-init
+          ./target/release/swag build e2e-app
+          test -n "$(find e2e-app/dist -type f -print -quit)"
+          ./target/release/swag test e2e-app

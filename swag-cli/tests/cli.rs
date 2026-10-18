@@ -179,11 +179,10 @@ fn banner_heads_new_init_and_vc_stderr() {
     let missing = std::env::temp_dir().join("swag-cli-test-missing-init");
     let (_, err, code) = swag(&[
         "init",
+        missing.to_str().expect("utf8"),
         "--template",
         "clean",
         "demo",
-        "--output",
-        missing.to_str().expect("utf8"),
         "--no-install",
         "--no-git-init",
     ]);

@@ -27,7 +27,9 @@ You can download the *SWAG* CLI from:
 
 ### Projects
 
-A Project can be created with `swag new`; use `swag init` to scaffold into an existing directory instead of creating a new one. Both prompt for a missing name/template, and you can manage user-level Projects with `swag projects`.
+A Project can be created with `swag new`; use `swag init <dir>` to scaffold into an existing directory instead of creating a new one. Both prompt for a missing name/template, and you can manage user-level Projects with `swag projects`.
+
+`swag init <dir>` accepts directories that only contain files from a fresh GitHub repo (`.git`, `.gitignore`, `README.md`, `LICENSE`) without `--force`: `.git`, `README.md` and `LICENSE` are preserved, while the template's `.gitignore` replaces the existing one. `swag update` never overwrites the preserved `README.md` or `LICENSE`.
 
 Commands are template-aware: fullstack and desktop projects mix Bun and Cargo, so `swag` drives every component a template provides.
 

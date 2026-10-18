@@ -121,6 +121,16 @@ pub fn update(options: &UpdateOptions) -> Result<UpdateReport> {
         .unwrap_or_default()
         .into_iter()
         .collect();
+    // Files kept from a pre-existing GitHub repo by `swag init` are user-owned:
+    // never diff, overwrite or prune them while they are still present. If the
+    // user deletes one, it stops being preserved and can be restored upstream.
+    let preserved_files: BTreeSet<String> = provenance
+        .preserved_files
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|rel| dir.join(rel).is_file())
+        .collect();
 
     // Fetch + personalize once; the temp dir is reused for the copy step so
     // the template is cloned a single time per `update` run.
@@ -132,8 +142,11 @@ pub fn update(options: &UpdateOptions) -> Result<UpdateReport> {
         crate::project::personalize_ids(&tmp, &ids, &provenance.name, provenance.owner.as_deref())?;
         let upstream_version = crate::template::read_template_version(&tmp);
         let upstream_commit = crate::project::head_commit(&tmp);
-        let fresh_files = crate::project::template_manifest(&tmp)?;
-        let (changed, added, removed) = diff_trees(&tmp, &dir, &prior_files)?;
+        let fresh_files: Vec<String> = crate::project::template_manifest(&tmp)?
+            .into_iter()
+            .filter(|rel| !preserved_files.contains(rel))
+            .collect();
+        let (changed, added, removed) = diff_trees(&tmp, &dir, &prior_files, &preserved_files)?;
         // Missing/different `.template_version` / `.template_type` files are
         // synced silently (they are not listed in `changed`/`added`), but
         // they still mean the project is not up to date.
@@ -203,6 +216,11 @@ pub fn update(options: &UpdateOptions) -> Result<UpdateReport> {
         // Pin the freshly fetched revision, falling back to the recorded one.
         updated.commit = upstream_commit.or_else(|| provenance.commit.clone());
         updated.template_files = Some(fresh_files);
+        updated.preserved_files = if preserved_files.is_empty() {
+            None
+        } else {
+            Some(preserved_files.iter().cloned().collect())
+        };
         provenance::save(&dir, &updated)?;
 
         Ok(UpdateReport {
@@ -446,6 +464,7 @@ fn diff_trees(
     fresh: &Path,
     project: &Path,
     prior_files: &BTreeSet<String>,
+    preserved_files: &BTreeSet<String>,
 ) -> Result<(Vec<String>, Vec<String>, Vec<String>)> {
     let fresh_map = snapshot_tree(fresh)?;
     let project_map = snapshot_tree(project)?;
@@ -455,11 +474,17 @@ fn diff_trees(
     let mut added = Vec::new();
     let mut removed = Vec::new();
     for key in fresh_keys.intersection(&project_keys) {
+        if preserved_files.contains(*key) {
+            continue;
+        }
         if fresh_map[*key] != project_map[*key] {
             changed.push((*key).clone());
         }
     }
     for key in fresh_keys.difference(&project_keys) {
+        if preserved_files.contains(*key) {
+            continue;
+        }
         // Files that only exist to pin the template itself are synced
         // silently, not reported as additions.
         if *key == crate::template::TEMPLATE_VERSION_FILE
@@ -470,6 +495,9 @@ fn diff_trees(
         added.push((*key).clone());
     }
     for key in project_keys.difference(&fresh_keys) {
+        if preserved_files.contains(*key) {
+            continue;
+        }
         // Only files that were template-managed at the last scaffold/update
         // count as "removed upstream". User-created files must never be
         // reported or pruned.
@@ -634,6 +662,125 @@ mod tests {
             fs::read_to_string(dest.join(".template_version")).unwrap(),
             "22\n"
         );
+
+        let again = update(&UpdateOptions {
+            dir: dest.clone(),
+            check_only: true,
+            dry_run: false,
+            force: false,
+            prune: false,
+            git_ref: None,
+        })
+        .unwrap();
+        assert!(again.up_to_date, "{again:?}");
+
+        unsafe {
+            match old {
+                Some(v) => std::env::set_var("SWAG_HOME", v),
+                None => std::env::remove_var("SWAG_HOME"),
+            }
+        }
+        let _ = fs::remove_dir_all(&home);
+        let _ = fs::remove_dir_all(&src);
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    /// `swag init` keeps README/LICENSE from a pre-existing repo; `update`
+    /// must not report or overwrite them, even when upstream changed.
+    #[test]
+    fn update_preserves_init_readme_and_license() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old = std::env::var("SWAG_HOME").ok();
+        let home = stamp("home-preserved");
+        unsafe { std::env::set_var("SWAG_HOME", &home) };
+
+        let src = stamp("src-preserved");
+        write_template_source(&src, "21\n", "v1");
+        fs::write(src.join("README.md"), "template readme v1\n").unwrap();
+        fs::write(src.join("LICENSE"), "template license v1\n").unwrap();
+        register_custom("tpl-upd-preserved", &src);
+
+        let dest = stamp("dest-preserved");
+        fs::create_dir_all(&dest).unwrap();
+        fs::write(dest.join("README.md"), "my readme\n").unwrap();
+        fs::write(dest.join("LICENSE"), "my license\n").unwrap();
+        crate::project::scaffold(&crate::ScaffoldOptions {
+            template: "tpl-upd-preserved".to_string(),
+            name: "demo".to_string(),
+            destination: Some(dest.clone()),
+            git_ref: None,
+            force: false,
+            owner: None,
+            no_install: true,
+            no_git_init: true,
+            init: true,
+        })
+        .unwrap();
+
+        fs::write(src.join("README.md"), "template readme v2\n").unwrap();
+        fs::write(src.join("LICENSE"), "template license v2\n").unwrap();
+        fs::write(src.join("app.txt"), "v2").unwrap();
+        fs::write(src.join(crate::template::TEMPLATE_VERSION_FILE), "22\n").unwrap();
+
+        let check = update(&UpdateOptions {
+            dir: dest.clone(),
+            check_only: true,
+            dry_run: false,
+            force: false,
+            prune: false,
+            git_ref: None,
+        })
+        .unwrap();
+        assert!(!check.up_to_date, "{check:?}");
+        assert!(check.changed.contains(&"app.txt".to_string()), "{check:?}");
+        assert!(
+            !check.changed.contains(&"README.md".to_string()),
+            "{check:?}"
+        );
+        assert!(!check.changed.contains(&"LICENSE".to_string()), "{check:?}");
+        assert!(!check.added.contains(&"README.md".to_string()), "{check:?}");
+        assert!(!check.added.contains(&"LICENSE".to_string()), "{check:?}");
+
+        let applied = update(&UpdateOptions {
+            dir: dest.clone(),
+            check_only: false,
+            dry_run: false,
+            force: false,
+            prune: true,
+            git_ref: None,
+        })
+        .unwrap();
+        assert!(applied.applied, "{applied:?}");
+        assert_eq!(fs::read_to_string(dest.join("app.txt")).unwrap(), "v2");
+        assert_eq!(
+            fs::read_to_string(dest.join("README.md")).unwrap(),
+            "my readme\n",
+            "update must not overwrite the preserved README"
+        );
+        assert_eq!(
+            fs::read_to_string(dest.join("LICENSE")).unwrap(),
+            "my license\n",
+            "update must not overwrite the preserved LICENSE"
+        );
+        assert!(
+            !applied.changed.contains(&"README.md".to_string()),
+            "{applied:?}"
+        );
+        assert!(
+            !applied.changed.contains(&"LICENSE".to_string()),
+            "{applied:?}"
+        );
+
+        let provenance = crate::provenance::load(&dest).unwrap();
+        assert_eq!(
+            provenance.preserved_files,
+            Some(vec!["LICENSE".to_string(), "README.md".to_string()])
+        );
+        let files = provenance
+            .template_files
+            .expect("manifest must be recorded");
+        assert!(!files.contains(&"README.md".to_string()), "{files:?}");
+        assert!(!files.contains(&"LICENSE".to_string()), "{files:?}");
 
         let again = update(&UpdateOptions {
             dir: dest.clone(),

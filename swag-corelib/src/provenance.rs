@@ -46,6 +46,12 @@ pub struct Provenance {
     /// disappeared upstream, so user-created files are never pruned.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template_files: Option<Vec<String>>,
+    /// Relative paths that already existed when `swag init` ran and were
+    /// deliberately kept instead of replaced by the template (currently
+    /// `README.md` and `LICENSE`). `swag update` never overwrites or prunes
+    /// these files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preserved_files: Option<Vec<String>>,
 }
 
 impl Provenance {
@@ -67,6 +73,7 @@ impl Provenance {
             owner: owner.map(str::to_string),
             commit: None,
             template_files: None,
+            preserved_files: None,
         }
     }
 }

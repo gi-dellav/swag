@@ -70,20 +70,22 @@ enum Command {
 
     /// Scaffold into a pre-existing directory instead of creating a new one.
     ///
-    /// Like `swag new`, but the destination directory must already exist and
-    /// is used in place: `--force` empties it first (the directory itself is
-    /// kept). The destination defaults to the current directory.
+    /// Like `swag new`, but `<DIR>` must already exist and is used in place.
+    /// A directory holding only files from a fresh GitHub repo (`.git`,
+    /// `.gitignore`, `README.md`, `LICENSE`) is accepted without `--force`:
+    /// `.git`, `README.md` and `LICENSE` are kept, while the template's
+    /// `.gitignore` replaces the existing one. `--force` empties the
+    /// directory first (the directory itself is kept).
     Init {
         /// template id: [default: svelte-clean-template]
         #[arg(short, long)]
         template: Option<String>,
 
+        /// Existing directory to scaffold into.
+        dir: PathBuf,
+
         /// Project name (package name); prompted when omitted.
         name: Option<String>,
-
-        /// Destination directory (defaults to the current directory).
-        #[arg(short, long)]
-        output: Option<PathBuf>,
 
         /// Clone a branch or tag instead of the default branch.
         /// (For custom git templates: wins over the registered ref.)
@@ -544,8 +546,8 @@ fn run() -> Result<(), Error> {
         }
         Command::Init {
             template,
+            dir,
             name,
-            output,
             git_ref,
             owner,
             force,
@@ -557,7 +559,7 @@ fn run() -> Result<(), Error> {
             run_scaffold(
                 template,
                 name,
-                output,
+                Some(dir),
                 git_ref,
                 owner,
                 force,
@@ -948,11 +950,11 @@ fn stdout_colorized(force: bool) -> bool {
 
 /// Shared implementation of `swag new` and `swag init`.
 ///
-/// `init` scaffolds into a pre-existing directory instead of creating one
-/// (see [`ScaffoldOptions::init`]). Both commands accept an optional NAME and
-/// `--template`: when either is omitted the user is asked on stdin, either
-/// with a `dialoguer` prompt (terminal) or by reading one line from stdin
-/// (piped input), so `echo demo | swag new` works.
+/// `init` scaffolds into the directory given on the command line instead of
+/// creating one (see [`ScaffoldOptions::init`]). Both commands accept an
+/// optional NAME and `--template`: when either is omitted the user is asked on
+/// stdin, either with a `dialoguer` prompt (terminal) or by reading one line
+/// from stdin (piped input), so `echo demo | swag new` works.
 #[allow(clippy::too_many_arguments)]
 fn run_scaffold(
     template: Option<String>,
@@ -1040,7 +1042,7 @@ fn resolve_template_id(id: &str) -> Result<String, Error> {
 }
 
 /// Default project name for `swag init`: the basename of the directory being
-/// initialized (`--output` when given, else the current directory).
+/// initialized.
 ///
 /// Returns `None` when the directory has no usable basename (filesystem root)
 /// or when that basename is not a valid project name, so the caller asks

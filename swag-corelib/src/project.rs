@@ -46,6 +46,13 @@ use crate::template::Template;
 /// Directories never entered during personalization (`.vercel` holds local
 /// link state created by `swag vc`, never template content).
 const SKIPPED_DIRS: [&str; 5] = [".git", "node_modules", "target", "dist", ".vercel"];
+/// Files a fresh GitHub repository may already contain when `swag init`
+/// targets it. They do not make the destination count as non-empty.
+const INIT_ALLOWED_ENTRIES: [&str; 4] = [".git", ".gitignore", "LICENSE", "README.md"];
+/// Pre-existing files kept as-is by `swag init`: the template versions are
+/// not copied over them. The template's `.gitignore` is deliberately absent:
+/// it describes the template layout and must replace any placeholder.
+const INIT_PRESERVED_FILES: [&str; 2] = ["LICENSE", "README.md"];
 /// Extensions considered text for the rewrite pass.
 const TEXT_EXTENSIONS: [&str; 15] = [
     "json", "md", "html", "ts", "js", "svelte", "toml", "yml", "yaml", "css", "txt", "svg", "xml",
@@ -63,7 +70,8 @@ pub struct ScaffoldOptions {
     pub template: String,
     /// New project name (directory + package name).
     pub name: String,
-    /// Where to create the project. Defaults to `<cwd>/<name>`.
+    /// Where to create the project. Defaults to `<cwd>/<name>`; `swag init`
+    /// always passes the directory it was given.
     pub destination: Option<PathBuf>,
     /// Clone a branch / tag instead of the default branch.
     pub git_ref: Option<String>,
@@ -217,22 +225,26 @@ pub fn list_templates() -> Vec<TemplateInfo> {
 ///
 /// Steps:
 /// 1. validate the project name (and `--owner` when given);
-/// 2. resolve the destination (`--output`, `<cwd>/<name>`, or the
-///    pre-existing directory for `init` mode);
+/// 2. resolve the destination (`--output`, `<cwd>/<name>`, or the directory
+///    given to `swag init`);
 /// 3. fetch the template: builtin/custom-git → `git clone --depth 1`,
-///    custom-path → recursive copy;
+///    custom-path → recursive copy. In `init` mode git templates are cloned
+///    to a temp directory and merged, so a pre-existing `.git/` survives;
 /// 4. rewrite template-name occurrences → project name (custom templates also
 ///    rewrite their base id; and, when `--owner` differs from the template
 ///    default, `gi-dellav` → owner everywhere, `gidellav` → owner with
 ///    hyphens stripped in the Tauri identifier);
-/// 5. delete the cloned `.git/` and (unless `no_git_init`) `git init`;
+/// 5. delete the cloned `.git/` (fresh scaffolds) and, unless `no_git_init`,
+///    `git init` when the destination has no repository yet;
 /// 6. run the template-aware install (Bun and/or Cargo, unless `no_install`);
 /// 7. auto-register the project in `~/.swag/projects.json`.
 ///
-/// In `init` mode (`options.init`) the destination must already exist:
-/// `swag init` scaffolds into a pre-existing directory instead of creating
-/// a new one, so `--force` empties it (keeping the directory itself)
-/// instead of deleting it first.
+/// In `init` mode (`options.init`) the destination must already exist.
+/// Files from a fresh GitHub repo (`.git`, `.gitignore`, `README.md`,
+/// `LICENSE`) are accepted without `--force`: `.git`, `README.md` and
+/// `LICENSE` are preserved, while the template's `.gitignore` replaces the
+/// existing one. `--force` empties the directory (keeping the directory
+/// itself) before scaffolding.
 pub fn scaffold(options: &ScaffoldOptions) -> Result<Project> {
     let resolved = custom_templates::resolve_id(&options.template)?;
     validate_project_name_resolved(&resolved, &options.name)?;
@@ -243,13 +255,25 @@ pub fn scaffold(options: &ScaffoldOptions) -> Result<Project> {
         resolve_destination(&options.name, options.destination.as_deref())?
     };
     prepare_destination(&dest, options.force, options.init)?;
-    fetch_template(&resolved, &dest, options.git_ref.as_deref())?;
-    // Capture the exact upstream revision while the clone's `.git/` still
-    // exists (it is deleted just below): provenance then pins the source.
-    let commit = head_commit(&dest);
+    let preserved = if options.init {
+        init_preserved_files(&dest)
+    } else {
+        Vec::new()
+    };
+    // `init` merges into a directory that may already hold a repository, so
+    // capture the upstream revision from a staged clone instead of `dest`.
+    let commit = if options.init {
+        fetch_template_in_place(&resolved, &dest, options.git_ref.as_deref(), &preserved)?
+    } else {
+        fetch_template(&resolved, &dest, options.git_ref.as_deref())?;
+        head_commit(&dest)
+    };
     let template_ids = resolved_template_ids(&resolved);
     personalize_ids(&dest, &template_ids, &options.name, owner.as_deref())?;
-    let template_files = template_manifest(&dest)?;
+    let template_files: Vec<String> = template_manifest(&dest)?
+        .into_iter()
+        .filter(|rel| !preserved.iter().any(|kept| kept == Path::new(rel)))
+        .collect();
     write_provenance(
         &dest,
         &resolved,
@@ -257,9 +281,12 @@ pub fn scaffold(options: &ScaffoldOptions) -> Result<Project> {
         owner.as_deref(),
         commit,
         Some(template_files),
+        preserved_rel_strings(&preserved),
     )?;
-    detach_history(&dest)?;
-    if !options.no_git_init {
+    if !options.init {
+        detach_history(&dest)?;
+    }
+    if !options.no_git_init && !dest.join(".git").exists() {
         git_init(&dest)?;
     }
 
@@ -295,6 +322,7 @@ fn write_provenance(
     owner: Option<&str>,
     commit: Option<String>,
     template_files: Option<Vec<String>>,
+    preserved_files: Option<Vec<String>>,
 ) -> Result<()> {
     let (template, base) = match resolved {
         ResolvedTemplate::Builtin(t) => (t.id().to_string(), None),
@@ -310,6 +338,7 @@ fn write_provenance(
     );
     provenance.commit = commit;
     provenance.template_files = template_files;
+    provenance.preserved_files = preserved_files;
     crate::provenance::save(dest, &provenance)
 }
 
@@ -436,6 +465,91 @@ pub(crate) fn fetch_template(
     }
 }
 
+/// Fetch a template into an `init` destination without replacing what is
+/// already there: git sources are staged in a temp directory and merged, path
+/// sources are copied directly. Returns the upstream commit for git sources.
+fn fetch_template_in_place(
+    resolved: &ResolvedTemplate,
+    dest: &Path,
+    git_ref: Option<&str>,
+    preserved: &[PathBuf],
+) -> Result<Option<String>> {
+    match resolved {
+        ResolvedTemplate::Builtin(template) => clone_template_in_place(
+            &template.clone_url(),
+            template.id(),
+            dest,
+            git_ref,
+            preserved,
+        ),
+        ResolvedTemplate::Custom(custom) => match &custom.source {
+            TemplateSource::Git {
+                url,
+                git_ref: base_ref,
+            } => {
+                let effective = git_ref.or(base_ref.as_deref());
+                clone_template_in_place(url, &custom.name, dest, effective, preserved)
+            }
+            TemplateSource::Path { path } => {
+                copy_template_dir_preserving(path, &custom.name, dest, preserved)?;
+                Ok(None)
+            }
+        },
+    }
+}
+
+/// Files already present in `dest` that must survive an in-place merge.
+fn init_preserved_files(dest: &Path) -> Vec<PathBuf> {
+    INIT_PRESERVED_FILES
+        .iter()
+        .map(PathBuf::from)
+        .filter(|rel| dest.join(rel).is_file())
+        .collect()
+}
+
+/// The preserved paths as UTF-8 strings for `.swag.json` (`None` when empty).
+fn preserved_rel_strings(preserved: &[PathBuf]) -> Option<Vec<String>> {
+    if preserved.is_empty() {
+        return None;
+    }
+    Some(
+        preserved
+            .iter()
+            .filter_map(|path| path.to_str().map(str::to_string))
+            .collect(),
+    )
+}
+
+/// Clone into a temp directory, record its HEAD, then merge everything except
+/// `.git/` into the (possibly non-empty) destination.
+fn clone_template_in_place(
+    url: &str,
+    label: &str,
+    dest: &Path,
+    git_ref: Option<&str>,
+    preserved: &[PathBuf],
+) -> Result<Option<String>> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = std::env::temp_dir().join(format!("swag-init-{}-{stamp}", std::process::id()));
+    if tmp.exists() {
+        fs::remove_dir_all(&tmp).map_err(|e| Error::Io {
+            context: format!("could not remove temp dir '{}'", tmp.display()),
+            source: e,
+        })?;
+    }
+    if let Err(error) = clone_template_url(url, label, &tmp, git_ref) {
+        let _ = fs::remove_dir_all(&tmp);
+        return Err(error);
+    }
+    let commit = head_commit(&tmp);
+    let merged = copy_template_dir_preserving(&tmp, label, dest, preserved);
+    let _ = fs::remove_dir_all(&tmp);
+    merged.map(|()| commit)
+}
+
 /// Ensure `name` is usable as a directory and a `package.json` name.
 ///
 /// Dots are accepted for plain web projects (npm allows `my.app`) but
@@ -545,9 +659,9 @@ fn resolve_destination(name: &str, output: Option<&Path>) -> Result<PathBuf> {
     Ok(cwd.join(name))
 }
 
-/// Resolve the `init` destination: `--output` when given, else the current
-/// directory. Unlike [`resolve_destination`], the directory must already
-/// exist — `swag init` never creates it.
+/// Resolve the `init` destination: the directory given on the command line.
+/// Unlike [`resolve_destination`], the directory must already exist —
+/// `swag init` never creates it.
 fn resolve_init_destination(output: Option<&Path>) -> Result<PathBuf> {
     if let Some(dir) = output {
         if !dir.is_dir() {
@@ -564,8 +678,9 @@ fn resolve_init_destination(output: Option<&Path>) -> Result<PathBuf> {
 /// Remove the destination when `--force` is given, else refuse to overwrite.
 ///
 /// In `init` mode the destination must already exist: `--force` empties it
-/// (keeping the directory itself) instead of deleting and recreating it,
-/// so `swag init --force` reuses the pre-existing directory.
+/// (keeping the directory itself) instead of deleting and recreating it.
+/// Without `--force`, a directory holding only the files of a fresh GitHub
+/// repo ([`INIT_ALLOWED_ENTRIES`]) is accepted and merged into in place.
 fn prepare_destination(dest: &Path, force: bool, init: bool) -> Result<()> {
     if !dest.exists() {
         if init {
@@ -573,21 +688,28 @@ fn prepare_destination(dest: &Path, force: bool, init: bool) -> Result<()> {
         }
         return Ok(());
     }
-    let non_empty = dest
+    let entries: Vec<String> = dest
         .read_dir()
         .map_err(|e| Error::Io {
             context: format!("could not read destination '{}'", dest.display()),
             source: e,
         })?
-        .next()
-        .is_some();
-    if non_empty && !force {
+        .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
+        .collect::<std::result::Result<_, _>>()
+        .map_err(|e| Error::Io {
+            context: format!("could not read destination '{}'", dest.display()),
+            source: e,
+        })?;
+    let blocking = entries
+        .iter()
+        .any(|name| !init || !INIT_ALLOWED_ENTRIES.contains(&name.as_str()));
+    if blocking && !force {
         return Err(Error::DestinationExists(dest.display().to_string()));
     }
     if force {
         ensure_destination_is_safe(dest, init)?;
         if init {
-            if non_empty {
+            if !entries.is_empty() {
                 eprintln!(
                     "swag: emptying '{}' before scaffolding (--force)",
                     dest.display()
@@ -633,8 +755,8 @@ fn destination_is_unsafe(dest: &Path, cwd: &Path, init: bool) -> bool {
 }
 
 /// Remove every entry inside `dir` while keeping `dir` itself (used by
-/// `init --force`). The template fetch (`git clone` into an empty dir, or
-/// a local copy) then proceeds exactly like a fresh scaffold.
+/// `init --force`). The template fetch then merges into the empty directory
+/// exactly like a fresh scaffold.
 fn clear_contents(dir: &Path) -> Result<()> {
     let entries = fs::read_dir(dir).map_err(|e| Error::Io {
         context: format!("could not read destination '{}'", dir.display()),
@@ -700,6 +822,17 @@ fn clone_template_url(url: &str, label: &str, dest: &Path, git_ref: Option<&str>
 /// Copy a local template directory into `dest` (skips `.git`, dependency
 /// trees, build output and local Vercel link state, like the clone path).
 fn copy_template_dir(src: &Path, label: &str, dest: &Path) -> Result<()> {
+    copy_template_dir_preserving(src, label, dest, &[])
+}
+
+/// Copy a local template directory into `dest`, skipping `preserved` paths so
+/// pre-existing files survive an in-place `init` merge.
+fn copy_template_dir_preserving(
+    src: &Path,
+    label: &str,
+    dest: &Path,
+    preserved: &[PathBuf],
+) -> Result<()> {
     let src = src.canonicalize().map_err(|e| Error::FetchFailed {
         template: label.to_string(),
         reason: format!(
@@ -760,6 +893,9 @@ fn copy_template_dir(src: &Path, label: &str, dest: &Path) -> Result<()> {
             let rel = path.strip_prefix(&src).map_err(|e| {
                 Error::CommandFailed(format!("could not copy template directory: {e}"))
             })?;
+            if preserved.iter().any(|kept| kept == rel) {
+                continue;
+            }
             if rel.components().any(|c| {
                 let name = c.as_os_str().to_string_lossy();
                 SKIPPED_DIRS.contains(&name.as_ref())
@@ -1320,6 +1456,81 @@ repository = "https://github.com/gi-dellav/svelte-clean-template"
                 .contains("demo"),
             "personalization must rewrite the base id"
         );
+
+        restore_home(&home, old);
+        let _ = fs::remove_dir_all(&src);
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    /// `init` accepts a fresh GitHub repo, preserving `.git`, `README.md` and
+    /// `LICENSE` while adopting the template's `.gitignore`.
+    #[test]
+    fn init_keeps_github_repo_files_without_force() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let (home, old) = isolated_home("init-github");
+        let src = stamp("init-github-src");
+        write_template_source(&src);
+        fs::write(src.join(".gitignore"), "template-ignore\n").unwrap();
+        fs::write(src.join("README.md"), "template readme\n").unwrap();
+        fs::write(src.join("LICENSE"), "template license\n").unwrap();
+        register_custom("tpl-init-github", &src);
+
+        let dest = stamp("init-github-dest");
+        fs::create_dir_all(dest.join(".git")).unwrap();
+        fs::write(dest.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::write(dest.join(".gitignore"), "placeholder\n").unwrap();
+        fs::write(dest.join("README.md"), "my readme\n").unwrap();
+        fs::write(dest.join("LICENSE"), "my license\n").unwrap();
+        let options = ScaffoldOptions {
+            template: "tpl-init-github".to_string(),
+            name: "demo".to_string(),
+            destination: Some(dest.clone()),
+            git_ref: None,
+            force: false,
+            owner: None,
+            no_install: true,
+            no_git_init: true,
+            init: true,
+        };
+        let project = scaffold(&options).unwrap();
+        assert_eq!(project.path, dest);
+        assert_eq!(
+            fs::read_to_string(dest.join(".git").join("HEAD")).unwrap(),
+            "ref: refs/heads/main\n",
+            ".git must be preserved"
+        );
+        assert_eq!(
+            fs::read_to_string(dest.join("README.md")).unwrap(),
+            "my readme\n",
+            "an existing README must be preserved"
+        );
+        assert_eq!(
+            fs::read_to_string(dest.join("LICENSE")).unwrap(),
+            "my license\n",
+            "an existing LICENSE must be preserved"
+        );
+        assert_eq!(
+            fs::read_to_string(dest.join(".gitignore")).unwrap(),
+            "template-ignore\n",
+            "the template .gitignore must replace the placeholder"
+        );
+        assert!(
+            fs::read_to_string(dest.join("package.json"))
+                .unwrap()
+                .contains("demo")
+        );
+
+        let provenance = crate::provenance::load(&dest).unwrap();
+        assert_eq!(
+            provenance.preserved_files,
+            Some(vec!["LICENSE".to_string(), "README.md".to_string()])
+        );
+        let files = provenance
+            .template_files
+            .expect("manifest must be recorded");
+        assert!(files.contains(&".gitignore".to_string()), "{files:?}");
+        assert!(!files.contains(&"README.md".to_string()), "{files:?}");
+        assert!(!files.contains(&"LICENSE".to_string()), "{files:?}");
 
         restore_home(&home, old);
         let _ = fs::remove_dir_all(&src);
