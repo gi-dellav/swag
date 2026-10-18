@@ -62,6 +62,7 @@ impl Sandbox {
         bin
     }
 
+    #[cfg(unix)]
     fn write(&self, relative: &str, content: &str) -> PathBuf {
         let path = self.root.join(relative);
         if let Some(parent) = path.parent() {
@@ -71,6 +72,7 @@ impl Sandbox {
         path
     }
 
+    #[cfg(unix)]
     fn fullstack(&self) -> PathBuf {
         self.write(".template_type", "backend\n");
         self.write(
@@ -82,6 +84,7 @@ impl Sandbox {
         self.root.clone()
     }
 
+    #[cfg(unix)]
     fn desktop(&self) -> PathBuf {
         self.write(".template_type", "desktop\n");
         self.write(
@@ -109,6 +112,7 @@ impl Sandbox {
         )
     }
 
+    #[cfg(unix)]
     fn calls(&self) -> Vec<String> {
         std::fs::read_to_string(&self.log)
             .unwrap_or_default()

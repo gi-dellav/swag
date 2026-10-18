@@ -1243,20 +1243,10 @@ fn print_project_human(entry: &swag_corelib::ProjectEntry) {
 fn enter_subshell(dir: &Path) -> Result<(), Error> {
     eprintln!("entering {} (exit to return)", dir.display());
     #[cfg(windows)]
-    let (program, arg) = (
-        std::env::var("COMSPEC").unwrap_or_else(|_| "cmd".to_string()),
-        None,
-    );
+    let program = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd".to_string());
     #[cfg(not(windows))]
-    let (program, arg): (String, Option<&str>) = (
-        std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string()),
-        None,
-    );
-    let mut cmd = std::process::Command::new(&program);
-    if let Some(arg) = arg {
-        cmd.arg(arg);
-    }
-    let status = cmd
+    let program = std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string());
+    let status = std::process::Command::new(&program)
         .current_dir(dir)
         .status()
         .map_err(|e| Error::CommandFailed(format!("could not spawn subshell '{program}': {e}")))?;

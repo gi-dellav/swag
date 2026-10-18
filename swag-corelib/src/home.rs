@@ -38,9 +38,9 @@ pub fn swag_home() -> Result<PathBuf> {
         {
             return Ok(PathBuf::from(appdata).join("swag"));
         }
-        return Err(Error::HomeNotFound(
+        Err(Error::HomeNotFound(
             "set the SWAG_HOME environment variable".to_string(),
-        ));
+        ))
     }
     #[cfg(not(windows))]
     {
