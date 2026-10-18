@@ -933,7 +933,7 @@ fn apply_replacements(content: &str, replacements: &[(String, String)]) -> Strin
         .filter(|(from, _)| !from.is_empty())
         .collect();
     // Longest first so `svelte-clean-template` wins over `svelte-clean`.
-    patterns.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+    patterns.sort_by_key(|a| std::cmp::Reverse(a.0.len()));
     if patterns.is_empty() {
         return content.to_string();
     }
